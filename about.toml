@@ -1,0 +1,40 @@
+# Copyright 2026 Tor Norbye
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Configuration for cargo-about (https://github.com/EmbarkStudios/cargo-about), which
+# generates THIRD-PARTY-LICENSES.txt for release archives (`make licenses`).
+#
+# `accepted` is also the project's license policy: generation fails if a dependency is not
+# available under one of these licenses, so CI rejects incompatible dependencies. All of them
+# are permissive and compatible with this project's Apache-2.0 license. For dependencies
+# offered under a choice of licenses, the first accepted one listed here is used.
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "Unlicense",
+    "Unicode-3.0",
+]
+
+# Only the platforms release binaries are built for (see .github/workflows/release.yml).
+targets = [
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+
+# Test-only and build-script dependencies are not part of the distributed binary.
+ignore-dev-dependencies = true
+ignore-build-dependencies = true

@@ -1,0 +1,86 @@
+# Copyright 2026 Tor Norbye
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[package]
+name = "markfmt"
+version = "1.0.0"
+edition = "2021"
+# Minimum supported Rust version, set by the locked `ignore`/`globset` dependencies.
+# Keep in sync with the `msrv` job in .github/workflows/ci.yml.
+rust-version = "1.88"
+authors = ["Tor Norbye"]
+license = "Apache-2.0"
+description = "Standalone Markdown, Markdeep, and agent instruction file formatter"
+readme = "README.md"
+repository = "https://github.com/tnorbye/markfmt"
+documentation = "https://docs.rs/markfmt"
+keywords = ["markdown", "formatter", "commonmark", "markdeep", "cli"]
+categories = ["command-line-utilities", "development-tools", "text-processing"]
+include = [
+    "src/**",
+    "Cargo.toml",
+    "Cargo.lock",
+    "LICENSE",
+    "README.md",
+]
+
+[[bin]]
+name = "markfmt"
+path = "src/main.rs"
+
+[lib]
+name = "markfmt"
+path = "src/lib.rs"
+
+[dependencies]
+anstream = "1"
+anstyle = "1"
+clap = { version = "4", features = ["derive"] }
+globset = "0.4"
+ignore = "0.4"
+pulldown-cmark = "0.12"
+serde = { version = "1", features = ["derive"] }
+similar = "2"
+tempfile = "3"
+toml = "1"
+unicode-width = "0.2"
+
+[dev-dependencies]
+comrak = { version = "0.59", default-features = false }
+pretty_assertions = "1"
+
+[profile.release]
+lto = true
+panic = "abort"
+strip = "symbols"
+codegen-units = 1
+
+# Prebuilt binary layout for `cargo binstall markfmt` and `taiki-e/install-action`.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }.tar.gz"
+bin-dir = "{ name }-v{ version }-{ target }/{ bin }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-x86_64-unknown-linux-musl.tar.gz"
+bin-dir = "{ name }-v{ version }-x86_64-unknown-linux-musl/{ bin }"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-aarch64-unknown-linux-musl.tar.gz"
+bin-dir = "{ name }-v{ version }-aarch64-unknown-linux-musl/{ bin }"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }.zip"
+bin-dir = "{ name }-v{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "zip"

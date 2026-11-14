@@ -1,0 +1,267 @@
+# Copyright 2026 Tor Norbye
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: Verify Release Readiness
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Verify tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "Error: Git tag ($GITHUB_REF_NAME -> $TAG_VERSION) does not match Cargo.toml version ($CARGO_VERSION)"
+            exit 1
+          fi
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check Markdown formatting
+        run: cargo run --locked -- --check .
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked --all-targets
+
+      - name: Check documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --locked
+
+  licenses:
+    name: Third-Party Licenses
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      # Keep the version in sync between ci.yml and release.yml.
+      - name: Install cargo-about
+        run: cargo install --locked cargo-about --version 0.9.3 --features cli
+
+      - name: Generate third-party license notices
+        run: make licenses
+
+      - name: Upload license notices
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: third-party-licenses
+          path: target/THIRD-PARTY-LICENSES.txt
+          if-no-files-found: error
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: [verify, licenses]
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux binaries use musl so they are fully static and run on any distribution,
+        # independent of the build runner's glibc version.
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            archive: tar.gz
+            bin: markfmt
+            cross: false
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            archive: tar.gz
+            bin: markfmt
+            cross: true
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+            bin: markfmt
+            cross: false
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+            bin: markfmt
+            cross: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            bin: markfmt.exe
+            cross: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      # Rust's musl targets link self-contained C runtime objects, so the GNU cross-linker works
+      # for this pure-Rust binary.
+      - name: Install Linux ARM64 cross-linker
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+
+      - name: Build release binary
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Smoke-test release binary
+        if: matrix.cross == false
+        shell: bash
+        run: |
+          BIN_PATH="target/${{ matrix.target }}/release/${{ matrix.bin }}"
+          VERSION_OUT="$("$BIN_PATH" --version | tr -d '\r')"
+          HELP_HEAD="$("$BIN_PATH" --help | head -n 1 | tr -d '\r')"
+          echo "Version output: $VERSION_OUT"
+          echo "Help header: $HELP_HEAD"
+          if [[ "$HELP_HEAD" != markfmt\ * ]] || [ "$VERSION_OUT" != "$HELP_HEAD" ]; then
+            echo "Unexpected --version / --help output"
+            exit 1
+          fi
+          FORMATTED="$(printf 'Some   spaced   words.\n' | "$BIN_PATH" - | tr -d '\r')"
+          if [ "$FORMATTED" != "Some spaced words." ]; then
+            echo "Unexpected formatting output: '$FORMATTED'"
+            exit 1
+          fi
+
+      - name: Download license notices
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: third-party-licenses
+          path: notices
+
+      - name: Package Unix release archive
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          STAGE="markfmt-v${VERSION}-${{ matrix.target }}"
+          mkdir -p "dist/${STAGE}"
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${STAGE}/"
+          cp README.md LICENSE notices/THIRD-PARTY-LICENSES.txt "dist/${STAGE}/"
+          tar -C dist -czf "dist/${STAGE}.tar.gz" "${STAGE}"
+          rm -rf "dist/${STAGE}"
+
+      - name: Package Windows release archive
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $Version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          $Stage = "markfmt-v$Version-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path "dist/$Stage" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/$Stage/"
+          Copy-Item "README.md" "dist/$Stage/"
+          Copy-Item "LICENSE" "dist/$Stage/"
+          Copy-Item "notices/THIRD-PARTY-LICENSES.txt" "dist/$Stage/"
+          Compress-Archive -Path "dist/$Stage" -DestinationPath "dist/$Stage.zip"
+          Remove-Item -Recurse -Force "dist/$Stage"
+
+      - name: Upload packaged binary artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: binary-${{ matrix.target }}
+          path: dist/*.${{ matrix.archive }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          pattern: binary-*
+          merge-multiple: true
+
+      - name: Stage installer scripts
+        run: |
+          sed "s/__MARKFMT_RELEASE_TAG__/${GITHUB_REF_NAME}/g" scripts/install.sh > dist/install.sh
+          sed "s/__MARKFMT_RELEASE_TAG__/${GITHUB_REF_NAME}/g" scripts/install.ps1 > dist/install.ps1
+          chmod +x dist/install.sh
+          sh -n dist/install.sh
+          if grep -q "__MARKFMT_RELEASE_TAG__" dist/install.sh dist/install.ps1; then
+            echo "Error: __MARKFMT_RELEASE_TAG__ placeholder was not replaced"
+            exit 1
+          fi
+
+      - name: Generate SHA-256 checksums
+        run: |
+          (cd dist && sha256sum markfmt-* install.sh install.ps1 > SHA256SUMS.txt && cat SHA256SUMS.txt)
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          # Tags like `v1.1.0-rc1` are published as pre-releases.
+          prerelease: ${{ contains(github.ref_name, '-') }}
