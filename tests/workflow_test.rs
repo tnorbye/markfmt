@@ -385,6 +385,7 @@ fn excludes_apply_across_symlinked_ancestors_and_parent_components() {
     ]));
 }
 
+#[cfg(unix)]
 #[test]
 fn symlinks_into_excluded_directories_are_excluded() {
     let project = Project::new();
