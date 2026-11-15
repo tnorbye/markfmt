@@ -100,7 +100,9 @@ fn checkbox_alone_on_its_line_keeps_the_following_blank_line() {
             "- [ ]\n\n  Second.\n\n- [x]\n",
             "- [ ]\n\n  Second.\n\n- [x]\n",
         ),
-        ("* [x]\n\n\n  Second.\n", "* [x]\n\n  Second.\n"),
+        // pulldown-cmark ends this list after the checkbox, but GFM keeps `Second.` in the item,
+        // so the list is kept exactly as written.
+        ("* [x]\n\n\n  Second.\n", "* [x]\n\n\n  Second.\n"),
     ] {
         assert_format(input, expected, &options(72));
         for width in [4, 12, 72] {

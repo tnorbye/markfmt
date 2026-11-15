@@ -1506,13 +1506,14 @@ fn format_single_list_item(
         })
         .collect();
     let has_lazy = lazy_lines.contains(&true);
-    // pulldown-cmark reads a checkbox that ends its line without trailing whitespace (`- [ ]`) as
-    // literal text. Joining a lazy line onto it would add the whitespace and make it a task, and
-    // indenting that line instead could turn it into a setext underline, so keep the layout.
-    let literal_checkbox_before_lazy =
+    // Renderers disagree about a checkbox that ends its line (`- [ ]`) followed by a lazy line:
+    // pulldown-cmark 0.12 reads the checkbox as text, 0.13 ends the list after it, and GFM keeps
+    // the lazy text in the item. Joining or indenting that line (which could also turn it into a
+    // setext underline) would pick one reading, so keep the layout.
+    let bare_checkbox_before_lazy =
         lazy_lines.first() == Some(&true) && matches!(rem0.as_str(), "[ ]" | "[x]" | "[X]");
     let preserve_lazy = has_lazy
-        && (options.wrap == crate::options::WrapMode::Preserve || literal_checkbox_before_lazy);
+        && (options.wrap == crate::options::WrapMode::Preserve || bare_checkbox_before_lazy);
     let marker = marker_override.unwrap_or(marker);
     let marker_prefix = if preserve_layout || preserve_lazy {
         let lead = preprocess::leading_ws_columns(line0, TAB_STOP).0;
@@ -1561,8 +1562,8 @@ fn format_single_list_item(
 
     let body = body_lines.join("\n");
     if body.trim().is_empty() {
-        // Whitespace after an otherwise empty checkbox decides whether it is a task item
-        // (`- [ ] `) or literal text (`- [ ]`) in pulldown-cmark, so keep what the source had.
+        // Whether whitespace follows an otherwise empty checkbox has decided between a task item
+        // (`- [ ] `) and literal text (`- [ ]`) in some renderers, so keep what the source had.
         let source_spaced = rem0.len() > rem0.trim_end_matches([' ', '\t']).len();
         return vec![if task_prefix.is_empty() || !source_spaced {
             first_prefix.trim_end().to_string()

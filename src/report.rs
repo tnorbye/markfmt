@@ -152,8 +152,8 @@ pub fn print_diff(name: &str, original: &str, formatted: &str) -> io::Result<()>
 
     writeln!(out, "{DIFF_HEADER}--- {old_header}{DIFF_HEADER:#}")?;
     writeln!(out, "{DIFF_HEADER}+++ {new_header}{DIFF_HEADER:#}")?;
-    let old_lines = diff.old_slices();
-    let new_lines = diff.new_slices();
+    let old_lines: Vec<&str> = diff.iter_old_slices().collect();
+    let new_lines: Vec<&str> = diff.iter_new_slices().collect();
     for hunk in udiff.iter_hunks() {
         writeln!(out, "{HUNK_HEADER}{}{HUNK_HEADER:#}", hunk.header())?;
         for op in hunk.ops() {
