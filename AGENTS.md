@@ -111,3 +111,9 @@ break before them.
   binaries.
 - GitHub Actions are pinned to commit SHAs with a version comment;
   Dependabot updates them. Don't replace a pin with a movable tag.
+- Releases come from pushing a `vX.Y.Z` tag that matches `version`
+  in [Cargo.toml](Cargo.toml) (see "Cutting a Release" in
+  [README.md](README.md)); the release workflow then publishes to
+  GitHub Releases and crates.io. Never push a release tag or run
+  `cargo publish` unless the maintainer asks: a crates.io version can be
+  yanked but never deleted or replaced.

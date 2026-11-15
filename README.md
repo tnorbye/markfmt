@@ -577,8 +577,10 @@ with `cargo install --path .`, or build the standalone binary at
 
 ### Using the Library
 
-The formatter is also a Rust library (`markfmt`); see the crate
-documentation (`make doc`) for an example of calling `format_markdown`
+The formatter is also a Rust library
+([`markfmt` on crates.io](https://crates.io/crates/markfmt)); see the
+[API documentation on docs.rs](https://docs.rs/markfmt) (or build it
+locally with `make doc`) for an example of calling `format_markdown`
 with `FormattingOptions`.
 
 ## Building & Development
@@ -648,9 +650,9 @@ and use the same version locally and in CI.
     on each runner) and uploads them as downloadable **Workflow Run
     Artifacts** (`binary-<target>`) without creating a public release.
 
-### Cutting a GitHub Release
+### Cutting a Release
 
-To bump the version and publish a new GitHub Release:
+To bump the version and publish a new release to GitHub and crates.io:
 
 1. Update `version = "X.Y.Z"` under `[package]` in
    [Cargo.toml](Cargo.toml).
@@ -664,10 +666,24 @@ git tag vX.Y.Z
 git push origin main --tags
 ```
 
-Pushing a `v*` tag triggers `.github/workflows/release.yml`, which
-verifies that the tag matches `Cargo.toml`, runs the full verification
-suite, and publishes the archives and `SHA256SUMS.txt` to the GitHub
-Release.
+Pushing a `v*` tag triggers `.github/workflows/release.yml`,
+which verifies that the tag matches `Cargo.toml`, runs the full
+verification suite (including a `cargo publish --dry-run`),
+and publishes the archives and `SHA256SUMS.txt` to the GitHub
+Release. Only after that succeeds does it publish the crate
+to [crates.io](https://crates.io/crates/markfmt), using
+[trusted publishing](https://crates.io/docs/trusted-publishing) instead
+of a stored token; [docs.rs](https://docs.rs/markfmt) then builds the
+API documentation automatically.
+
+A crates.io version can be yanked but never deleted or replaced, so
+check the tag before pushing it. If the crates.io job fails after the
+GitHub Release was created (for example, a network error), re-run just
+that job from the workflow run page.
+
+Trusted publishing is configured once on crates.io, under the crate's
+**Settings → Trusted Publishing**: add a GitHub publisher for repository
+`tnorbye/markfmt` with workflow `release.yml`.
 
 ## License
 
