@@ -49,7 +49,7 @@ anstyle = "1"
 clap = { version = "4", features = ["derive"] }
 globset = "0.4"
 ignore = "0.4"
-pulldown-cmark = "0.12"
+pulldown-cmark = "0.13"
 serde = { version = "1", features = ["derive"] }
 similar = "2"
 tempfile = "3"
