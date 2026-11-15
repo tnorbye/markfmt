@@ -51,7 +51,7 @@ globset = "0.4"
 ignore = "0.4"
 pulldown-cmark = "0.12"
 serde = { version = "1", features = ["derive"] }
-similar = "2"
+similar = "3"
 tempfile = "3"
 toml = "1"
 unicode-width = "0.2"
