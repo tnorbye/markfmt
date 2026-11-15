@@ -195,7 +195,8 @@ fn explain_reports_discovery_and_configuration_exclusions() {
     }
     let output = project.run(&["--explain", "."]);
     assert_success(&output);
-    let text = String::from_utf8(output.stdout).unwrap();
+    // Windows prints `.\keep.md`; compare with `/` separators on every platform.
+    let text = String::from_utf8(output.stdout).unwrap().replace('\\', "/");
     assert!(text.contains("Included ./keep.md"), "{text}");
     assert!(
         text.contains("Skipped ./ignored.md: matched ignore rules"),
@@ -286,7 +287,8 @@ fn explain_summarizes_ignored_directories_and_skips_ignored_non_markdown() {
     project.write("build/notes.md", "Build notes.\n");
     let output = project.run(&["--explain", "."]);
     assert_success(&output);
-    let text = String::from_utf8(output.stdout).unwrap();
+    // Windows prints `.\keep.md`; compare with `/` separators on every platform.
+    let text = String::from_utf8(output.stdout).unwrap().replace('\\', "/");
     assert!(
         text.contains("Skipped 7 Markdown files in ./vendor: matched ignore rules"),
         "{text}"
