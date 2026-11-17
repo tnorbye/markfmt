@@ -16,7 +16,8 @@ use std::fs;
 use std::path::Path;
 
 use clap::builder::{EnumValueParser, TypedValueParser};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
+use clap_complete::Shell;
 
 use crate::options::{
     CliOverrides, OrderedListStyle, OrderedListStyleName, WrapMode, WrapModeName,
@@ -84,12 +85,13 @@ pub struct Cli {
         long = "max-line-width",
         visible_aliases = ["line-width", "right-margin"],
         value_name = "N",
+        value_hint = clap::ValueHint::Other,
         value_parser = parse_positive_usize
     )]
     pub max_line_width: Option<usize>,
 
     /// Override continuation and nested list indent spaces
-    #[arg(long = "hanging-indent", value_name = "N")]
+    #[arg(long = "hanging-indent", value_name = "N", value_hint = clap::ValueHint::Other)]
     pub hanging_indent: Option<usize>,
 
     /// Align GFM table columns [default: on]
@@ -143,7 +145,12 @@ pub struct Cli {
     pub no_editorconfig: bool,
 
     /// Use this config file instead of searching for .markfmt.toml
-    #[arg(long = "config", value_name = "PATH", conflicts_with = "no_config")]
+    #[arg(
+        long = "config",
+        value_name = "PATH",
+        value_hint = clap::ValueHint::FilePath,
+        conflicts_with = "no_config"
+    )]
     pub config: Option<String>,
 
     /// Do not read .markfmt.toml files
@@ -151,7 +158,7 @@ pub struct Cli {
     pub no_config: bool,
 
     /// Skip files matching this pattern (relative to the current directory; repeatable)
-    #[arg(long = "exclude", value_name = "PATTERN")]
+    #[arg(long = "exclude", value_name = "PATTERN", value_hint = clap::ValueHint::Other)]
     pub exclude: Vec<String>,
 
     /// Do not respect .gitignore when traversing directories
@@ -166,20 +173,26 @@ pub struct Cli {
     #[arg(
         long = "overlaps-git-changes",
         value_name = "MODE",
+        value_hint = clap::ValueHint::Other,
         value_parser = parse_git_mode
     )]
     pub overlaps_git_changes: Vec<GitChangeMode>,
 
     /// Explicit path to git executable
-    #[arg(long = "git-path", value_name = "PATH")]
+    #[arg(long = "git-path", value_name = "PATH", value_hint = clap::ValueHint::ExecutablePath)]
     pub git_path: Option<String>,
 
     /// Only format blocks overlapping 1-based line range(s), e.g. `5:10` or `1:3,8`
-    #[arg(long = "lines", alias = "line", value_name = "START:END")]
+    #[arg(
+        long = "lines",
+        alias = "line",
+        value_name = "RANGE",
+        value_hint = clap::ValueHint::Other
+    )]
     pub lines: Vec<String>,
 
     /// Virtual file path when formatting stdin (`-`) for .editorconfig/Markdeep
-    #[arg(long = "stdin-filepath", value_name = "PATH")]
+    #[arg(long = "stdin-filepath", value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
     pub stdin_filepath: Option<String>,
 
     /// Print paths of files that would change without modifying them (exits 0)
@@ -206,8 +219,16 @@ pub struct Cli {
     #[arg(short = 'v', long = "verbose")]
     pub verbose: bool,
 
+    /// Print a completion script for SHELL to stdout and exit
+    #[arg(long = "completions", value_name = "SHELL", exclusive = true)]
+    pub completions: Option<Shell>,
+
+    /// Print a man page in roff format to stdout and exit
+    #[arg(long = "man", exclusive = true)]
+    pub man: bool,
+
     /// Input files or directories (use `-` for stdin)
-    #[arg(value_name = "FILES")]
+    #[arg(value_name = "FILES", value_hint = clap::ValueHint::AnyPath)]
     pub files: Vec<String>,
 }
 
@@ -238,6 +259,22 @@ impl Cli {
             ordered_lists: self.ordered_lists,
         }
     }
+}
+
+/// Renders a completion script for `shell` (`--completions`).
+pub fn completions(shell: Shell) -> Vec<u8> {
+    let mut out = Vec::new();
+    clap_complete::generate(shell, &mut Cli::command(), "markfmt", &mut out);
+    out
+}
+
+/// Renders the `markfmt(1)` man page in roff format (`--man`).
+pub fn man_page() -> Vec<u8> {
+    let mut out = Vec::new();
+    clap_mangen::Man::new(Cli::command())
+        .render(&mut out)
+        .expect("writing to a Vec cannot fail");
+    out
 }
 
 /// Expands `@<filename>` response files and normalizes kdoc-formatter compatibility flags.

@@ -67,7 +67,7 @@ pub enum WrapMode {
     Never,
     /// Keep the existing line breaks; only normalize whitespace and indentation.
     Preserve,
-    /// Start each sentence on a new line ("semantic line breaks"), wrapping sentences that are
+    /// Start each sentence on a new line (semantic line breaks), wrapping sentences that are
     /// longer than the maximum width.
     Sentence,
 }
@@ -98,7 +98,7 @@ pub(crate) enum WrapModeName {
     Never,
     /// Keep the existing line breaks; only normalize whitespace and indentation.
     Preserve,
-    /// Start each sentence on a new line ("semantic line breaks"), wrapping sentences that are
+    /// Start each sentence on a new line (semantic line breaks), wrapping sentences that are
     /// longer than the maximum width.
     Sentence,
 }

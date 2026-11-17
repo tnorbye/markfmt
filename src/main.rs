@@ -49,6 +49,21 @@ fn main() {
     };
     report::apply_color(cli.color);
 
+    let generated = match cli.completions {
+        Some(shell) => Some(cli::completions(shell)),
+        None if cli.man => Some(cli::man_page()),
+        None => None,
+    };
+    if let Some(bytes) = generated {
+        match io::stdout().lock().write_all(&bytes) {
+            // A closed pipe (`markfmt --man | head`) is not an error.
+            Err(err) if err.kind() != io::ErrorKind::BrokenPipe => {
+                fail(&format!("Failed to write to stdout: {err}"))
+            }
+            _ => return,
+        }
+    }
+
     if cli.files.is_empty() {
         eprintln!("Usage: markfmt [OPTIONS] <FILES>...");
         fail("No input files or directories specified.");

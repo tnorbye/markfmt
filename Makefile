@@ -16,8 +16,12 @@ CARGO ?= cargo
 RUSTC ?= rustc
 CARGO_FLAGS ?=
 TARGET ?=
+# Extra flags for the host build that generates the man page and completions in `make dist`
+# (CARGO_FLAGS go to the release build of TARGET, and may select another target).
+HOST_CARGO_FLAGS ?=
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
+MANDIR ?= $(PREFIX)/share/man
 CARGO_ABOUT ?= cargo about
 LICENSES_FILE := target/THIRD-PARTY-LICENSES.txt
 
@@ -57,24 +61,30 @@ licenses:
 	@mkdir -p target
 	$(CARGO_ABOUT) generate --locked --fail --config about.toml about.hbs -o $(LICENSES_FILE)
 
+# Builds and packages TARGET (default: CARGO_BUILD_TARGET, else the host), always passing it to
+# Cargo as --target so the archive name matches the binary inside it.
 dist: licenses
 	@set -e; \
 	VERSION="$$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"; \
-	if [ -n "$(TARGET)" ]; then \
-		TRIPLE="$(TARGET)"; \
-		$(CARGO) build --release --target "$$TRIPLE" $(CARGO_FLAGS); \
-		BIN_DIR="target/$$TRIPLE/release"; \
-	else \
-		TRIPLE="$$($(RUSTC) -vV | sed -n 's/^host: //p')"; \
-		$(CARGO) build --release $(CARGO_FLAGS); \
-		BIN_DIR="target/release"; \
-	fi; \
-	BIN_NAME="markfmt"; \
-	if [ -f "$$BIN_DIR/markfmt.exe" ]; then BIN_NAME="markfmt.exe"; fi; \
+	HOST="$$($(RUSTC) -vV | sed -n 's/^host: //p')"; \
+	set -- $(CARGO_FLAGS); \
+	for arg do \
+		case "$$arg" in --target | --target=*) \
+			echo "error: make dist names the archive after its target; pass TARGET=<triple> instead of --target in CARGO_FLAGS" >&2; \
+			exit 1;; \
+		esac; \
+	done; \
+	TRIPLE="$(TARGET)"; \
+	if [ -z "$$TRIPLE" ]; then TRIPLE="$${CARGO_BUILD_TARGET:-$$HOST}"; fi; \
+	BIN="$$(CARGO="$(CARGO)" sh scripts/cargo-executable.sh --release --target "$$TRIPLE" \
+		--bin markfmt "$$@")"; \
 	STAGE="markfmt-v$${VERSION}-$${TRIPLE}"; \
 	rm -rf "target/dist/$$STAGE" "target/dist/$${STAGE}.tar.gz" "target/dist/$${STAGE}.tar.gz.sha256"; \
 	mkdir -p "target/dist/$$STAGE"; \
-	cp "$$BIN_DIR/$$BIN_NAME" README.md LICENSE $(LICENSES_FILE) "target/dist/$$STAGE/"; \
+	cp "$$BIN" README.md LICENSE $(LICENSES_FILE) "target/dist/$$STAGE/"; \
+	EXTRAS_BIN="$$(CARGO="$(CARGO)" sh scripts/cargo-executable.sh --target "$$HOST" \
+		--bin markfmt $(HOST_CARGO_FLAGS))"; \
+	sh scripts/generate-extras.sh "$$EXTRAS_BIN" "target/dist/$$STAGE"; \
 	tar -C target/dist -czf "target/dist/$${STAGE}.tar.gz" "$$STAGE"; \
 	rm -rf "target/dist/$$STAGE"; \
 	if command -v sha256sum >/dev/null 2>&1; then \
@@ -84,14 +94,28 @@ dist: licenses
 	fi; \
 	echo "Created distribution: target/dist/$${STAGE}.tar.gz"
 
-install: release
-	install -d "$(DESTDIR)$(BINDIR)"
-	rm -f "$(DESTDIR)$(BINDIR)/markfmt"
-	install -m 755 target/release/markfmt "$(DESTDIR)$(BINDIR)/markfmt"
-	@echo "Installed $(DESTDIR)$(BINDIR)/markfmt"
+# The binary's path comes from Cargo, so custom target directories and CARGO_BUILD_TARGET work.
+# The man page comes from that binary, or from a host build (HOST_CARGO_FLAGS) when it cannot run
+# here, such as for a cross-compilation target. It is generated before anything is installed.
+install:
+	@set -e; \
+	BIN="$$(CARGO="$(CARGO)" sh scripts/cargo-executable.sh --release --bin markfmt $(CARGO_FLAGS))"; \
+	MAN="$$(mktemp)"; \
+	trap 'rm -f "$$MAN"' EXIT; \
+	if ! "$$BIN" --man > "$$MAN" 2>/dev/null; then \
+		HOST="$$($(RUSTC) -vV | sed -n 's/^host: //p')"; \
+		MAN_BIN="$$(CARGO="$(CARGO)" sh scripts/cargo-executable.sh --target "$$HOST" \
+			--bin markfmt $(HOST_CARGO_FLAGS))"; \
+		"$$MAN_BIN" --man > "$$MAN"; \
+	fi; \
+	install -d "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(MANDIR)/man1"; \
+	rm -f "$(DESTDIR)$(BINDIR)/markfmt"; \
+	install -m 755 "$$BIN" "$(DESTDIR)$(BINDIR)/markfmt"; \
+	install -m 644 "$$MAN" "$(DESTDIR)$(MANDIR)/man1/markfmt.1"; \
+	echo "Installed $(DESTDIR)$(BINDIR)/markfmt and $(DESTDIR)$(MANDIR)/man1/markfmt.1"
 
 uninstall:
-	rm -f "$(DESTDIR)$(BINDIR)/markfmt"
+	rm -f "$(DESTDIR)$(BINDIR)/markfmt" "$(DESTDIR)$(MANDIR)/man1/markfmt.1"
 
 clean:
 	$(CARGO) clean

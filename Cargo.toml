@@ -47,6 +47,8 @@ path = "src/lib.rs"
 anstream = "1"
 anstyle = "1"
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+clap_mangen = "0.3"
 globset = "0.4"
 ignore = "0.4"
 pulldown-cmark = "0.13"

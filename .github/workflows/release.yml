@@ -103,9 +103,38 @@ jobs:
           path: target/THIRD-PARTY-LICENSES.txt
           if-no-files-found: error
 
+  # The man page and completions are the same for every target, so generate them once on a host
+  # that can run the binary (several build targets are cross-compiled and cannot).
+  extras:
+    name: Man Page and Completions
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Generate man page and shell completions
+        run: |
+          cargo build --locked
+          sh scripts/generate-extras.sh target/debug/markfmt extras
+
+      - name: Upload man page and completions
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: extras
+          path: extras
+          if-no-files-found: error
+
   build:
     name: Build (${{ matrix.target }})
-    needs: [verify, licenses]
+    needs: [verify, licenses, extras]
     strategy:
       fail-fast: false
       matrix:
@@ -196,6 +225,12 @@ jobs:
           name: third-party-licenses
           path: notices
 
+      - name: Download man page and completions
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: extras
+          path: extras
+
       - name: Package Unix release archive
         if: matrix.archive == 'tar.gz'
         shell: bash
@@ -205,6 +240,7 @@ jobs:
           mkdir -p "dist/${STAGE}"
           cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${STAGE}/"
           cp README.md LICENSE notices/THIRD-PARTY-LICENSES.txt "dist/${STAGE}/"
+          cp -R extras/man extras/completions "dist/${STAGE}/"
           tar -C dist -czf "dist/${STAGE}.tar.gz" "${STAGE}"
           rm -rf "dist/${STAGE}"
 
@@ -219,6 +255,7 @@ jobs:
           Copy-Item "README.md" "dist/$Stage/"
           Copy-Item "LICENSE" "dist/$Stage/"
           Copy-Item "notices/THIRD-PARTY-LICENSES.txt" "dist/$Stage/"
+          Copy-Item -Recurse "extras/man", "extras/completions" "dist/$Stage/"
           Compress-Archive -Path "dist/$Stage" -DestinationPath "dist/$Stage.zip"
           Remove-Item -Recurse -Force "dist/$Stage"
 

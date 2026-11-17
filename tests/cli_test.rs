@@ -379,6 +379,55 @@ fn version_baked_into_version_and_help_flags() {
 }
 
 #[test]
+fn completions_and_man_page_for_packagers() {
+    // Each shell's script names the binary and offers its long options.
+    for shell in ["bash", "elvish", "fish", "powershell", "zsh"] {
+        let out = Command::new(bin())
+            .args(["--completions", shell])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "`--completions {shell}` failed: {out:?}"
+        );
+        let script = String::from_utf8_lossy(&out.stdout);
+        assert!(script.contains("markfmt"), "{shell}: {script}");
+        assert!(script.contains("max-line-width"), "{shell}: {script}");
+        // Unescaped `"` inside enum help breaks Fish/Zsh quoting, and `:` in value names breaks
+        // Zsh `_arguments` action specs.
+        if matches!(shell, "fish" | "zsh") {
+            assert!(!script.contains("(\"semantic"), "{shell}: {script}");
+        }
+        if shell == "zsh" {
+            assert!(!script.contains(":START:END:"), "{script}");
+            assert!(script.contains(":_files"), "{script}");
+        }
+        if shell == "fish" {
+            assert!(
+                script.contains("-l max-line-width") && script.contains(" -r -f"),
+                "{script}"
+            );
+        }
+    }
+
+    let out = Command::new(bin()).arg("--man").output().unwrap();
+    assert!(out.status.success(), "`--man` failed: {out:?}");
+    let man = String::from_utf8_lossy(&out.stdout);
+    let title = format!(".TH markfmt 1  \"markfmt {}\"", env!("CARGO_PKG_VERSION"));
+    assert!(man.contains(&title), "{man}");
+    assert!(man.contains(r"\-\-max\-line\-width"), "{man}");
+
+    // Neither mixes with formatting work.
+    for args in [
+        &["--man", "README.md"][..],
+        &["--completions", "zsh", "--check"],
+    ] {
+        let out = Command::new(bin()).args(args).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {out:?}");
+    }
+}
+
+#[test]
 fn overlaps_git_changes_matches_non_ascii_paths() {
     if Command::new("git").arg("--version").output().is_err() {
         return;

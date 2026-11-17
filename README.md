@@ -487,7 +487,7 @@ of the file unformatted.
 | `--filter-files`                | Apply Markdown discovery rules to explicitly named files                     |
 | `--overlaps-git-changes <MODE>` | Only format blocks overlapping `uncommitted`, `staged`, or `HEAD` changes    |
 | `--git-path <PATH>`             | Explicit path to the `git` executable                                        |
-| `--lines <START:END>`           | Only format blocks overlapping 1-based line range(s) on a single file        |
+| `--lines <RANGE>`               | Only format blocks overlapping 1-based line range(s) on a single file        |
 | `--stdin-filepath <PATH>`       | Virtual path for configuration and Markdeep detection when reading `-`       |
 | `-n`, `--dry-run`               | Print paths of files that would change without modifying them                |
 | `--check`                       | Verify formatting without modifying files; exit `1` if changes are needed    |
@@ -495,6 +495,8 @@ of the file unformatted.
 | `--color <WHEN>`                | Color output and diffs: `auto` (default, terminals only), `always`, `never`  |
 | `-q`, `--quiet`                 | Suppress summary output                                                      |
 | `-v`, `--verbose`               | Also list each reformatted file                                              |
+| `--completions <SHELL>`         | Print a `bash`, `zsh`, `fish`, `powershell`, or `elvish` completion script   |
+| `--man`                         | Print the `markfmt(1)` man page in roff format                               |
 | `-h`, `--help`                  | Print help information (including the embedded version)                      |
 | `-V`, `--version`               | Print version information                                                    |
 | `@<filename>`                   | Read newline-separated arguments/paths from `<filename>`                     |
@@ -557,23 +559,39 @@ cargo binstall markfmt
 
 ### From Source
 
-Build and install into `~/.local/bin/markfmt` from a local checkout
-(requires Rust 1.88 or newer):
+Build and install into `~/.local/bin/markfmt` (and its man page into
+`~/.local/share/man/man1/markfmt.1`) from a local checkout (requires
+Rust 1.88 or newer):
 
 ```sh
 make install
 ```
 
-Override `PREFIX` to install elsewhere (for example, `/usr/local/bin`):
+Override `PREFIX` to install elsewhere (for example, `/usr/local/bin`
+and `/usr/local/share/man`; `BINDIR` and `MANDIR` set each directly):
 
 ```sh
 sudo make install PREFIX=/usr/local
 ```
 
-Remove an installed binary with `make uninstall` (passing the
-same `PREFIX` if overridden). You can also install from a checkout
+Remove an installed binary and man page with `make uninstall` (passing
+the same `PREFIX` if overridden). You can also install from a checkout
 with `cargo install --path .`, or build the standalone binary at
 `target/release/markfmt` with `cargo build --release`.
+
+### Shell Completions and Man Page
+
+Release archives include a man page (`man/man1/markfmt.1`) and
+completion scripts (`completions/`) for bash, zsh, fish, PowerShell,
+and Elvish, and `make install` installs the man page. With any other
+installation, generate them from the binary:
+
+```sh
+markfmt --completions zsh > ~/.zfunc/_markfmt
+markfmt --completions bash > ~/.local/share/bash-completion/completions/markfmt
+markfmt --completions fish > ~/.config/fish/completions/markfmt.fish
+markfmt --man > ~/.local/share/man/man1/markfmt.1
+```
 
 ### Using the Library
 
@@ -590,19 +608,19 @@ and package manager). A convenience [Makefile](Makefile) and
 [.cargo/config.toml](.cargo/config.toml) are also included to provide
 Gradle-style targets:
 
-| Task                 | `make` target    | Underlying `cargo` command                             |
-| :------------------- | :--------------- | :----------------------------------------------------- |
-| Format Rust & docs   | `make fmt`       | `cargo fmt --all && cargo run -- .`                    |
-| Verify formatting    | `make fmt-check` | `cargo fmt --all -- --check && cargo run -- --check .` |
-| Lint                 | `make lint`      | `cargo clippy --all-targets -- -D warnings`            |
-| Run tests            | `make test`      | `cargo test`                                           |
-| Build API docs       | `make doc`       | `cargo doc --no-deps` (warnings are errors)            |
-| Full check (`check`) | `make check`     | Runs `fmt-check`, `lint`, `test`, and `doc`            |
-| Build release binary | `make release`   | `cargo build --release`                                |
-| License notices      | `make licenses`  | `cargo about generate` (see [Licenses](#license))      |
-| Package distribution | `make dist`      | Builds release archive in `target/dist/`               |
-| Install locally      | `make install`   | Installs release binary to `~/.local/bin` (`PREFIX`)   |
-| Uninstall            | `make uninstall` | Removes binary from `$(PREFIX)/bin`                    |
+| Task                 | `make` target    | Underlying `cargo` command                               |
+| :------------------- | :--------------- | :------------------------------------------------------- |
+| Format Rust & docs   | `make fmt`       | `cargo fmt --all && cargo run -- .`                      |
+| Verify formatting    | `make fmt-check` | `cargo fmt --all -- --check && cargo run -- --check .`   |
+| Lint                 | `make lint`      | `cargo clippy --all-targets -- -D warnings`              |
+| Run tests            | `make test`      | `cargo test`                                             |
+| Build API docs       | `make doc`       | `cargo doc --no-deps` (warnings are errors)              |
+| Full check (`check`) | `make check`     | Runs `fmt-check`, `lint`, `test`, and `doc`              |
+| Build release binary | `make release`   | `cargo build --release`                                  |
+| License notices      | `make licenses`  | `cargo about generate` (see [Licenses](#license))        |
+| Package distribution | `make dist`      | Builds release archive in `target/dist/`                 |
+| Install locally      | `make install`   | Installs binary and man page under `~/.local` (`PREFIX`) |
+| Uninstall            | `make uninstall` | Removes binary and man page from `$(PREFIX)`             |
 
 See [AGENTS.md](AGENTS.md) for the project's invariants, code map, and
 conventions.
@@ -629,11 +647,13 @@ and use the same version locally and in CI.
 - **Standalone release binary (`make release` or
   `cargo build --release`)**: Writes the stripped executable to
   `target/release/markfmt` (`target\release\markfmt.exe` on Windows).
-- **Local distribution archive (`make dist`)**: Builds the release
-  binary for the host platform (or a specific Rust target via
-  `make dist TARGET=<rust-triple>`) and packages `markfmt`, `README.md`,
-  `LICENSE`, and `THIRD-PARTY-LICENSES.txt` into `target/dist/` (Cargo's
-  equivalent of Gradle's `build/distributions/`). Requires `cargo-about`
+- **Local distribution archive (`make dist`)**: Builds the
+  release binary for the host platform (or a specific Rust
+  target via `make dist TARGET=<rust-triple>`) and packages
+  `markfmt`, `README.md`, `LICENSE`, `THIRD-PARTY-LICENSES.txt`,
+  the man page, and shell completions (written by
+  `scripts/generate-extras.sh`) into `target/dist/` (Cargo's equivalent
+  of Gradle's `build/distributions/`). Requires `cargo-about`
   (`cargo install --locked cargo-about --features cli`):
   - `target/dist/markfmt-v<version>-<target>.tar.gz`
   - `target/dist/markfmt-v<version>-<target>.tar.gz.sha256`
