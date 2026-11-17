@@ -1065,6 +1065,35 @@ fn only_the_last_configured_trailer_key_is_recognized() {
 }
 
 #[test]
+fn relative_git_dir_still_finds_the_comment_character() {
+    let project = Project::new();
+    project.init_git();
+    project.git(&["config", "core.commentChar", ";"]);
+    fs::create_dir_all(project.path().join("sub")).unwrap();
+    let message = "Subject\n\nBody text.\n; comment   with   spaces\n";
+    for (dir, git_dir, file) in [
+        ("sub", "../.git", "../.git/COMMIT_EDITMSG"),
+        ("", ".git", "sub/COMMIT_EDITMSG"),
+    ] {
+        let path = project.path().join(dir).join(file);
+        fs::write(&path, message).unwrap();
+        let out = project
+            .command()
+            .current_dir(project.path().join(dir))
+            .env("GIT_DIR", git_dir)
+            .arg(file)
+            .output()
+            .unwrap();
+        assert_success(&out);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            message,
+            "{git_dir} {file}"
+        );
+    }
+}
+
+#[test]
 fn comment_prefix_ending_in_a_space_keeps_wrapping_a_tab_separated_line() {
     // `//\t` is not a `// ` comment, but `// ` is: the line is indented by a space instead of
     // being kept as written.

@@ -65,8 +65,9 @@ break before them.
   errors and warnings, colored word-highlighted diffs). Messages go
   through `anstream`; formatted document content never does, so it is
   written byte-for-byte.
-- [src/cli.rs](src/cli.rs): `clap` definitions and `@file` argument
-  expansion.
+- [src/cli.rs](src/cli.rs): `clap` definitions, `@file` argument
+  expansion, and `clang-format` compatibility (single-dash flags and
+  detecting `git-clang-format`).
 - [src/discovery.rs](src/discovery.rs): directory walking, Markdown file
   detection, and commit-message path detection.
 - [src/editorconfig.rs](src/editorconfig.rs): `.editorconfig`
@@ -75,8 +76,9 @@ break before them.
   `[commit_message]` settings) and `exclude` pattern matching.
 - [src/lint.rs](src/lint.rs): warnings that never change output (such as
   `|` inside a code span in a table).
-- [src/range_filter.rs](src/range_filter.rs): `--lines` and
-  `--overlaps-git-changes` filtering.
+- [src/range_filter.rs](src/range_filter.rs): `--lines` and git-change
+  filtering (`--overlaps-git-changes`, `--staged`, `--since`), including
+  moving git line ranges onto the working tree or stdin.
 - [src/preprocess.rs](src/preprocess.rs): splits a document into
   segments the CommonMark parser should not see directly (frontmatter,
   ignore directives, display math, Markdeep constructs, prompt tags, and

@@ -35,25 +35,71 @@ pub enum ColorWhen {
     Never,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GitChangeMode {
-    /// Changes in the most recent commit (`git show HEAD`).
-    Head,
     /// Staged changes (`git diff --cached`).
     Staged,
     /// Staged and unstaged changes to tracked files (`git diff HEAD`) plus untracked files.
     Uncommitted,
+    /// Working-tree changes relative to `<rev>` (`git diff <rev>`) plus untracked files (`--since`).
+    Since(String),
+    /// Changes introduced by a single commit (`git show <rev>`, including `HEAD`).
+    Commit(String),
+    /// Committed changes in `<base>..<head>` or `<base>...<head>`.
+    Range {
+        base: String,
+        head: String,
+        merge_base: bool,
+    },
+}
+
+fn validate_git_rev(rev: &str) -> Result<String, String> {
+    if rev.is_empty() || rev.contains('\0') {
+        return Err("Git revision must not be empty".to_string());
+    }
+    if rev.starts_with('-') {
+        return Err(format!(
+            "Invalid git revision `{rev}`: revisions cannot start with `-`"
+        ));
+    }
+    Ok(rev.to_string())
 }
 
 fn parse_git_mode(s: &str) -> Result<GitChangeMode, String> {
-    match s.to_ascii_lowercase().as_str() {
-        "head" => Ok(GitChangeMode::Head),
-        "staged" => Ok(GitChangeMode::Staged),
-        "uncommitted" => Ok(GitChangeMode::Uncommitted),
-        _ => Err(format!(
-            "--overlaps-git-changes supports `HEAD`, `staged`, and `uncommitted`, got `{s}`"
-        )),
+    if s.is_empty() {
+        return Err("--overlaps-git-changes requires a mode, commit, or range".to_string());
     }
+    if !s.contains('/') {
+        match s.to_ascii_lowercase().as_str() {
+            "head" => return Ok(GitChangeMode::Commit("HEAD".to_string())),
+            "staged" | "cached" => return Ok(GitChangeMode::Staged),
+            "uncommitted" => return Ok(GitChangeMode::Uncommitted),
+            _ => {}
+        }
+    }
+    // As in Git, an omitted side of a range is `HEAD` (`main..` is `main..HEAD`).
+    let side = |rev: &str| -> Result<String, String> {
+        if rev.is_empty() {
+            Ok("HEAD".to_string())
+        } else {
+            validate_git_rev(rev)
+        }
+    };
+    for (dots, merge_base) in [("...", true), ("..", false)] {
+        if let Some((base, head)) = s.split_once(dots) {
+            if (base.is_empty() && head.is_empty()) || head.starts_with('.') {
+                return Err(format!(
+                    "Invalid git range `{s}`: give `<base>{dots}<head>`, `<base>{dots}`, or `{dots}<head>` (use `--since <rev>` to diff the working tree against a commit)"
+                ));
+            }
+            return Ok(GitChangeMode::Range {
+                base: side(base)?,
+                head: side(head)?,
+                merge_base,
+            });
+        }
+    }
+    Ok(GitChangeMode::Commit(validate_git_rev(s)?))
 }
 
 fn parse_positive_usize(s: &str) -> Result<usize, String> {
@@ -176,7 +222,14 @@ pub struct Cli {
             "print_config",
             "explain",
             "lines",
-            "overlaps_git_changes"
+            "overlaps_git_changes",
+            "staged",
+            "since",
+            "stdout",
+            "in_place",
+            "style",
+            "fallback_style",
+            "sort_includes"
         ]
     )]
     pub commit_editor: Option<Option<String>>,
@@ -229,7 +282,7 @@ pub struct Cli {
     #[arg(long = "filter-files")]
     pub filter_files: bool,
 
-    /// Only format blocks overlapping git changes (`HEAD`, `staged`, or `uncommitted`; repeatable)
+    /// Only format blocks overlapping git changes (`uncommitted`, `staged`/`cached`, `<COMMIT>`, or `<BASE>..<HEAD>`/`<BASE>...<HEAD>`; repeatable)
     #[arg(
         long = "overlaps-git-changes",
         value_name = "MODE",
@@ -237,6 +290,19 @@ pub struct Cli {
         value_parser = parse_git_mode
     )]
     pub overlaps_git_changes: Vec<GitChangeMode>,
+
+    /// Only format blocks overlapping staged git changes (shorthand for `--overlaps-git-changes=staged`)
+    #[arg(long = "staged", visible_alias = "cached")]
+    pub staged: bool,
+
+    /// Only format blocks overlapping working-tree or untracked changes since `<REV>` (repeatable)
+    #[arg(
+        long = "since",
+        value_name = "REV",
+        value_hint = clap::ValueHint::Other,
+        value_parser = validate_git_rev
+    )]
+    pub since: Vec<String>,
 
     /// Explicit path to git executable
     #[arg(long = "git-path", value_name = "PATH", value_hint = clap::ValueHint::ExecutablePath)]
@@ -251,9 +317,74 @@ pub struct Cli {
     )]
     pub lines: Vec<String>,
 
-    /// Virtual file path when formatting stdin (`-`) for .editorconfig/Markdeep/commit detection
-    #[arg(long = "stdin-filepath", value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
+    /// Virtual file path when formatting stdin (`-`) for .editorconfig/Markdeep/commit detection (implies `-` without `<FILES>`)
+    #[arg(
+        long = "stdin-filepath",
+        visible_alias = "assume-filename",
+        value_name = "PATH",
+        value_hint = clap::ValueHint::FilePath
+    )]
     pub stdin_filepath: Option<String>,
+
+    /// Write formatted output to stdout without modifying files (automatic under git-clang-format)
+    #[arg(
+        long = "stdout",
+        overrides_with = "in_place",
+        conflicts_with_all = ["check", "diff", "dry_run", "print_config", "explain"]
+    )]
+    pub stdout: bool,
+
+    /// Modify files in place (default)
+    #[arg(
+        short = 'i',
+        long = "in-place",
+        overrides_with = "stdout",
+        conflicts_with_all = ["check", "diff", "dry_run", "print_config", "explain"]
+    )]
+    pub in_place: bool,
+
+    /// Ignored; accepted for compatibility with git-clang-format
+    #[arg(long = "style", value_name = "STYLE", hide = true)]
+    pub style: Option<String>,
+
+    /// Ignored; accepted for compatibility with clang-format-diff.py
+    #[arg(long = "fallback-style", value_name = "STYLE", hide = true)]
+    pub fallback_style: Option<String>,
+
+    /// Ignored; accepted for compatibility with clang-format-diff.py
+    #[arg(
+        long = "sort-includes",
+        value_name = "BOOL",
+        hide = true,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        value_parser = clap::value_parser!(bool)
+    )]
+    pub sort_includes: Option<bool>,
+
+    /// Print the given files that `--exclude` or `.markfmt.toml` excludes, then exit
+    // Clang-format style flags, `--config`, `--exclude`, and `--commit-msg` stay allowed: they
+    // are what `git-clang-format` passes, or change what is excluded.
+    #[arg(
+        long = "list-ignored",
+        conflicts_with_all = [
+            "check",
+            "diff",
+            "dry_run",
+            "print_config",
+            "explain",
+            "commit_editor",
+            "lines",
+            "overlaps_git_changes",
+            "staged",
+            "since",
+            "stdout",
+            "in_place",
+            "stdin_filepath"
+        ]
+    )]
+    pub list_ignored: bool,
 
     /// Print paths of files that would change without modifying them (exits 0)
     #[arg(short = 'n', long = "dry-run")]
@@ -321,6 +452,61 @@ impl Cli {
             trailer_separators: self.trailer_separators.clone(),
         }
     }
+
+    /// Combines `--overlaps-git-changes`, `--staged`, and `--since` in order without duplicates.
+    pub fn git_change_modes(&self) -> Vec<GitChangeMode> {
+        let mut modes = Vec::new();
+        let mut push_unique = |mode: GitChangeMode| {
+            if !modes.contains(&mode) {
+                modes.push(mode);
+            }
+        };
+        for mode in &self.overlaps_git_changes {
+            push_unique(mode.clone());
+        }
+        if self.staged {
+            push_unique(GitChangeMode::Staged);
+        }
+        for rev in &self.since {
+            push_unique(GitChangeMode::Since(rev.clone()));
+        }
+        modes
+    }
+
+    /// Whether file outputs should be written to stdout rather than back to disk.
+    ///
+    /// Also enabled automatically when `git-clang-format` invokes `markfmt` in working-tree
+    /// mode (`markfmt [--style=...] [--lines=a:b] path/to/file.md` with `GIT_INDEX_FILE` set
+    /// to its temporary `clang-format-index*` file; `--whole-file` omits `--lines`), or when a
+    /// clang-format style flag (`--style`, `--fallback-style`, `--sort-includes`) is given.
+    /// A direct `markfmt --lines=a:b file.md` still edits the file in place.
+    pub fn write_to_stdout(&self) -> bool {
+        if self.stdout {
+            return true;
+        }
+        if self.in_place || self.check || self.diff || self.dry_run {
+            return false;
+        }
+        // Style flags only make sense from clang-format tooling, which reads stdout.
+        self.has_clang_format_style_flag() || is_git_clang_format_index()
+    }
+
+    /// Whether a clang-format style flag was given (`--sort-includes=false` included: only its
+    /// presence matters).
+    pub fn has_clang_format_style_flag(&self) -> bool {
+        self.style.is_some() || self.fallback_style.is_some() || self.sort_includes.is_some()
+    }
+}
+
+/// Whether `git-clang-format` is running `markfmt`: it points `GIT_INDEX_FILE` at its temporary
+/// `clang-format-index*` file while formatting, in every mode.
+pub fn is_git_clang_format_index() -> bool {
+    std::env::var_os("GIT_INDEX_FILE").is_some_and(|val| {
+        Path::new(&val)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("clang-format-index"))
+    })
 }
 
 /// Renders a completion script for `shell` (`--completions`).
@@ -339,7 +525,51 @@ pub fn man_page() -> Vec<u8> {
     out
 }
 
-/// Expands `@<filename>` response files and normalizes kdoc-formatter compatibility flags.
+/// `clang-format` flags that tools may spell with a single dash (`-lines=1:2`).
+const CLANG_FORMAT_LONG_FLAGS: [&str; 7] = [
+    "list-ignored",
+    "lines",
+    "line",
+    "assume-filename",
+    "style",
+    "fallback-style",
+    "sort-includes",
+];
+
+fn normalize_arg(arg: &str) -> String {
+    match arg {
+        "-help" => "--help".to_string(),
+        "--align-table-columns=false" | "--align-table-columns=off" => {
+            "--no-align-table-columns".to_string()
+        }
+        "--align-table-columns=true" | "--align-table-columns=on" => {
+            "--align-table-columns".to_string()
+        }
+        _ if !arg.starts_with("--")
+            && CLANG_FORMAT_LONG_FLAGS.iter().any(|flag| {
+                arg.strip_prefix('-')
+                    .and_then(|rest| rest.strip_prefix(flag))
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('='))
+            }) =>
+        {
+            format!("-{arg}")
+        }
+        _ => arg.to_string(),
+    }
+}
+
+fn push_arg(token: &str, after_double_dash: &mut bool, out: &mut Vec<String>) {
+    if *after_double_dash {
+        out.push(token.to_string());
+    } else if token == "--" {
+        *after_double_dash = true;
+        out.push(token.to_string());
+    } else {
+        out.push(normalize_arg(token));
+    }
+}
+
+/// Expands `@<filename>` response files and normalizes compatibility flags.
 pub fn expand_args<I, S>(raw_args: I) -> Result<Vec<String>, String>
 where
     I: IntoIterator<Item = S>,
@@ -354,41 +584,24 @@ where
     let mut after_double_dash = false;
     for arg_ref in iter {
         let arg = arg_ref.as_ref();
-        if after_double_dash {
-            out.push(arg.to_string());
-            continue;
-        }
-        if arg == "--" {
-            after_double_dash = true;
-            out.push(arg.to_string());
-            continue;
-        }
-        if let Some(path_str) = arg.strip_prefix('@') {
-            if path_str.is_empty() {
-                return Err("Empty `@` argument file path".to_string());
-            }
-            let path = Path::new(path_str);
-            let content = fs::read_to_string(path)
-                .map_err(|e| format!("Failed to read argument file `{path_str}`: {e}"))?;
-            for line in content.split('\n') {
-                let trimmed = line.trim();
-                if !trimmed.is_empty() {
-                    out.push(trimmed.to_string());
+        if !after_double_dash {
+            if let Some(path_str) = arg.strip_prefix('@') {
+                if path_str.is_empty() {
+                    return Err("Empty `@` argument file path".to_string());
                 }
+                let path = Path::new(path_str);
+                let content = fs::read_to_string(path)
+                    .map_err(|e| format!("Failed to read argument file `{path_str}`: {e}"))?;
+                for line in content.split('\n') {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        push_arg(trimmed, &mut after_double_dash, &mut out);
+                    }
+                }
+                continue;
             }
-            continue;
         }
-
-        match arg {
-            "-help" => out.push("--help".to_string()),
-            "--align-table-columns=false" | "--align-table-columns=off" => {
-                out.push("--no-align-table-columns".to_string())
-            }
-            "--align-table-columns=true" | "--align-table-columns=on" => {
-                out.push("--align-table-columns".to_string())
-            }
-            _ => out.push(arg.to_string()),
-        }
+        push_arg(arg, &mut after_double_dash, &mut out);
     }
 
     Ok(out)

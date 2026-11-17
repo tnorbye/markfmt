@@ -132,6 +132,33 @@ impl Counts {
     }
 }
 
+/// `name` without `.` path components (`./a.md` is `a.md`), for file names in messages and in
+/// patch headers (which `git apply` rejects them in). The file addressed is the same.
+pub fn path_label(name: &str) -> String {
+    let separators: &[char] = if cfg!(windows) { &['/', '\\'] } else { &['/'] };
+    if !name.split(separators).any(|part| part == ".") {
+        return name.to_string();
+    }
+    let mut label = String::new();
+    let mut rest = name;
+    while !rest.is_empty() {
+        let (part, sep, tail) = match rest.find(separators) {
+            Some(i) => (&rest[..i], &rest[i..i + 1], &rest[i + 1..]),
+            None => (rest, "", ""),
+        };
+        if part != "." {
+            label.push_str(part);
+            label.push_str(sep);
+        }
+        rest = tail;
+    }
+    if label.is_empty() {
+        name.to_string()
+    } else {
+        label
+    }
+}
+
 /// Prints a unified diff from `original` to `formatted` on stdout.
 ///
 /// When stdout is not a color terminal this is a standard unified diff (usable with `patch`
@@ -140,8 +167,9 @@ impl Counts {
 /// paragraph that was only rewrapped shows no highlighting at all.
 pub fn print_diff(name: &str, original: &str, formatted: &str) -> io::Result<()> {
     let diff = TextDiff::from_lines(original, formatted);
-    let old_header = format!("a/{name}");
-    let new_header = format!("b/{name}");
+    let label = path_label(name);
+    let old_header = format!("a/{label}");
+    let new_header = format!("b/{label}");
     let mut udiff = diff.unified_diff();
     udiff.context_radius(3).header(&old_header, &new_header);
 

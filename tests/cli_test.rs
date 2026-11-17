@@ -837,3 +837,48 @@ fn install_script_verifies_checksum_and_installs_binary() {
     );
     assert!(!bad_dir.join("markfmt").exists());
 }
+
+#[test]
+fn list_ignored_and_commit_editor_reject_flags_they_would_ignore() {
+    let tmp = TempDir::new().unwrap();
+    let file = tmp.path().join("COMMIT_EDITMSG");
+    let original = "Subject\n\nBody   text   here.\n";
+    fs::write(&file, original).unwrap();
+    let file = file.to_str().unwrap();
+    for args in [
+        vec!["--list-ignored", "--check", file],
+        vec!["--list-ignored", "--diff", file],
+        vec!["--list-ignored", "--commit-editor", file],
+        vec!["--commit-editor", "--style=file", file],
+        vec!["--commit-editor", "--sort-includes", file],
+    ] {
+        let out = Command::new(bin())
+            .args(&args)
+            .env("MARKFMT_EDITOR", "true")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("cannot be used with"),
+            "{args:?}"
+        );
+        assert_eq!(fs::read_to_string(file).unwrap(), original);
+    }
+
+    // git-clang-format passes a style flag with `-list-ignored`.
+    let out = Command::new(bin())
+        .args([
+            "-list-ignored",
+            "--style=file",
+            "--exclude=COMMIT_EDITMSG",
+            file,
+        ])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

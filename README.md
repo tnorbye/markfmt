@@ -224,8 +224,13 @@ Files ending in `.md.html` or containing `markdeep.min.js` /
 
 - **Recursive folder formatting** with `.gitignore` support and
   [exclude patterns](#configuration-file).
-- **Partial formatting**: only the blocks touched by uncommitted,
-  staged, or last-commit git changes, or by given line ranges.
+- **[Partial formatting](#formatting-only-what-changed)**: only the
+  blocks touched by uncommitted or staged changes, a commit, a commit
+  range, or everything since a revision (`--since`), or by given line
+  ranges.
+- **[`git clang-format`](#formatting-only-what-changed) support**:
+  `markfmt` works as its `--binary` (and with `clang-format-diff.py`),
+  so existing clang-format workflows also format Markdown.
 - **`--check`, `--diff`, and `--dry-run`** for CI and previews, with
   colored, word-highlighted diffs on terminals.
 - **Configuration** from `.editorconfig` and `.markfmt.toml`, plus
@@ -312,30 +317,111 @@ warnings are colored too. Color follows `--color auto|always|never`
 
 ### Formatting Only What Changed
 
-Format only the blocks touched by git changes:
+Format only the blocks touched by git changes (when `<FILES>` is
+omitted, the current folder `.` is formatted):
 
 - `uncommitted`: everything not yet committed, staged or not
   (`git diff HEAD`), plus new untracked files.
-- `staged`: staged changes only (`git diff --cached`).
-- `HEAD`: the most recent commit (`git show HEAD`).
+- `staged` (or `cached`, or top-level `--staged` / `--cached`): staged
+  changes only (`git diff --cached`).
+- `--since <REV>`: everything in the working tree (staged or not) that
+  differs from `<REV>` (`git diff <REV>`), plus new untracked files
+  (`git clang-format <commit>` without the untracked files).
+- `<COMMIT>` (such as `HEAD`, `HEAD~1`, `HEAD@{1 day ago}`, or a
+  tag/SHA): only the changes introduced by that single commit (a merge
+  is compared with its first parent). To select a branch whose name
+  matches a mode keyword (`staged`, `cached`, `uncommitted`, or `HEAD`),
+  write `refs/heads/<name>`.
+- `<BASE>...<HEAD>`: changes on `<HEAD>` since it branched from `<BASE>`
+  (`git diff <BASE>...<HEAD>`), the usual choice for a pull request.
+- `<BASE>..<HEAD>`: every difference between the two commits
+  (`git diff <BASE> <HEAD>`), including changes made only on `<BASE>`. A
+  revision that itself contains `..` must be given as a SHA.
+
+As in Git, an omitted side of a range is `HEAD`: `main...` is
+`main...HEAD`.
+
+Files are always formatted as they are in the working tree. For
+`staged`, `<COMMIT>`, and ranges, the changed lines are first
+moved past any later edits in the working tree (unstaged edits,
+or commits after `<COMMIT>` or `<HEAD>`), so they still select the
+same blocks and never lines inserted between them. Stdin is matched
+against its actual contents: `uncommitted` and `--since` compare
+stdin directly with `HEAD` or `<REV>` (including unsaved editor
+edits and new buffers), while `staged`, `<COMMIT>`, and ranges
+map their selected blocks onto stdin, so piping the staged version
+(`git show :doc.md | markfmt --staged --stdin-filepath doc.md -`) or an
+unsaved editor buffer works.
 
 ```sh
-markfmt --overlaps-git-changes=uncommitted .
-markfmt --overlaps-git-changes=staged .
-markfmt --overlaps-git-changes=HEAD .
+markfmt --overlaps-git-changes=uncommitted
+markfmt --staged
+markfmt --since main
+markfmt --overlaps-git-changes=HEAD
+markfmt --check --overlaps-git-changes=origin/main...HEAD
 ```
 
-Format only blocks overlapping lines `10..=25` of a single file:
+Format only blocks overlapping lines `10..=25` of a single file (when
+combined with `--staged`, `--since`, or `--overlaps-git-changes`, blocks
+must overlap both `--lines` and the git changes):
 
 ```sh
 markfmt --lines 10:25 README.md
 ```
 
+`markfmt` implements the parts of the `clang-format` interface that
+`git-clang-format` uses (in working-tree, `--staged`, two-commit
+`--diff`, and `--whole-file` modes). Its default file extensions do not
+include Markdown:
+
+```sh
+git clang-format --binary markfmt --extensions md,markdown
+```
+
+To make that permanent in a repository (or `--global`):
+
+```sh
+git config clangFormat.binary markfmt
+git config clangFormat.extensions md,markdown
+```
+
+- `-list-ignored <FILES>` prints the given files that `.markfmt.toml` or
+  `--exclude` excludes, so `git-clang-format` leaves them alone.
+- `git-clang-format` reads the formatted file from stdout, so
+  `markfmt` prints it there (instead of editing the file) when
+  `GIT_INDEX_FILE` names `git-clang-format`'s temporary index, or when
+  a clang-format style flag is given (`--style`, `--fallback-style`,
+  or `--sort-includes`, which are otherwise ignored). In that mode,
+  a single named file that is excluded is printed unchanged, and so
+  is excluded stdin under `git-clang-format`'s temporary index (older
+  versions without `-list-ignored` pipe files in `--staged` and
+  two-commit modes).
+- `git-clang-format` reads file names from `git diff` without decoding
+  quoted names, so set `git config core.quotePath false` if any have
+  non-ASCII characters.
+
+With `clang-format-diff.py`, pass `-i` to edit files in place. To
+print a diff instead, also pass `-style` (with any value), which makes
+`markfmt` print to stdout. Without either, `markfmt --lines` edits the
+file in place, as it does when you run it directly.
+
+```sh
+git diff -U0 | clang-format-diff.py -p1 -binary markfmt -iregex '.*\.md' -i
+git diff -U0 | clang-format-diff.py -p1 -binary markfmt -iregex '.*\.md' -style file
+```
+
 ### Editors and Scripts (stdin)
 
-Format via stdin/stdout, with an optional virtual path for
-`.editorconfig`, `.markfmt.toml`, Markdeep, and commit-message
-detection. Only the formatted document is printed, never a summary:
+Format via stdin/stdout, with an optional virtual path
+(`--stdin-filepath` or `--assume-filename`) for `.editorconfig`,
+`.markfmt.toml`, Markdeep, and commit-message detection. When a virtual
+path (or, as with `clang-format`, a style flag such as `-style=file`)
+is given without `<FILES>`, `-` is implied. Pass `--stdout` to print
+formatted output for file arguments without modifying them on disk (`-i`
+/ `--in-place` forces in-place writes). Only the formatted documents are
+printed, never a summary; like `clang-format`, several files are printed
+one after another with nothing between them, so pass one file at a time
+if you need to tell them apart:
 
 ```sh
 cat guide.md | markfmt --stdin-filepath docs/guide.md -
@@ -538,42 +624,47 @@ of the file unformatted.
 
 ### Options
 
-| Flag                            | Description                                                                  |
-| :------------------------------ | :--------------------------------------------------------------------------- |
-| `--max-line-width <N>`          | Maximum line width (`72`; aliases `--line-width`, `--right-margin`)          |
-| `--hanging-indent <N>`          | Override continuation and nested list indent spaces                          |
-| `--no-align-table-columns`      | Leave GFM table column spacing unchanged (`--align-table-columns` forces on) |
-| `--greedy`                      | Use greedy line breaking instead of optimal Knuth-Plass balancing            |
-| `--optimal`                     | Force optimal line breaking, overriding `greedy = true` in configuration     |
-| `--print-config`                | Print effective settings and configuration sources without modifying files   |
-| `--explain`                     | Explain included and skipped inputs without modifying files                  |
-| `--wrap <MODE>`                 | `always` (default), `never`, `preserve`, or `sentence`                       |
-| `--ordered-lists <STYLE>`       | `preserve` (default), `ascending`, or `one`                                  |
-| `--commit-msg`                  | Format as a Git or Jujutsu commit message (alias `--commit-message`)         |
-| `--commit-editor[=<CMD>]`       | Edit with `<CMD>` (`$MARKFMT_EDITOR`/`$VISUAL`/`$EDITOR`), then format       |
-| `--comment-char <CHAR>`         | Commit comment prefix (`#`, `;`, `//`, or `auto`; reads `git config`)        |
-| `--trailer-separators <CHARS>`  | Commit trailer separators (default from `git config trailer.separators`)     |
-| `--config <PATH>`               | Use this config file instead of searching for `.markfmt.toml`                |
-| `--no-config`                   | Do not read `.markfmt.toml` files                                            |
-| `--exclude <PATTERN>`           | Skip matching files (relative to the current directory; repeatable)          |
-| `--no-editorconfig`             | Do not read `.editorconfig` files                                            |
-| `--no-ignore`                   | Do not respect `.gitignore` when traversing directories                      |
-| `--filter-files`                | Apply Markdown discovery rules to explicitly named files                     |
-| `--overlaps-git-changes <MODE>` | Only format blocks overlapping `uncommitted`, `staged`, or `HEAD` changes    |
-| `--git-path <PATH>`             | Explicit path to the `git` executable                                        |
-| `--lines <RANGE>`               | Only format blocks overlapping 1-based line range(s) on a single file        |
-| `--stdin-filepath <PATH>`       | Virtual path for config, Markdeep, and commit detection when reading `-`     |
-| `-n`, `--dry-run`               | Print paths of files that would change without modifying them                |
-| `--check`                       | Verify formatting without modifying files; exit `1` if changes are needed    |
-| `--diff`                        | Print a unified diff of formatting changes without modifying files           |
-| `--color <WHEN>`                | Color output and diffs: `auto` (default, terminals only), `always`, `never`  |
-| `-q`, `--quiet`                 | Suppress summary output                                                      |
-| `-v`, `--verbose`               | Also list each reformatted file                                              |
-| `--completions <SHELL>`         | Print a `bash`, `zsh`, `fish`, `powershell`, or `elvish` completion script   |
-| `--man`                         | Print the `markfmt(1)` man page in roff format                               |
-| `-h`, `--help`                  | Print help information (including the embedded version)                      |
-| `-V`, `--version`               | Print version information                                                    |
-| `@<filename>`                   | Read newline-separated arguments/paths from `<filename>`                     |
+| Flag                            | Description                                                                                |
+| :------------------------------ | :----------------------------------------------------------------------------------------- |
+| `--max-line-width <N>`          | Maximum line width (`72`; aliases `--line-width`, `--right-margin`)                        |
+| `--hanging-indent <N>`          | Override continuation and nested list indent spaces                                        |
+| `--no-align-table-columns`      | Leave GFM table column spacing unchanged (`--align-table-columns` forces on)               |
+| `--greedy`                      | Use greedy line breaking instead of optimal Knuth-Plass balancing                          |
+| `--optimal`                     | Force optimal line breaking, overriding `greedy = true` in configuration                   |
+| `--print-config`                | Print effective settings and configuration sources without modifying files                 |
+| `--explain`                     | Explain included and skipped inputs without modifying files                                |
+| `--wrap <MODE>`                 | `always` (default), `never`, `preserve`, or `sentence`                                     |
+| `--ordered-lists <STYLE>`       | `preserve` (default), `ascending`, or `one`                                                |
+| `--commit-msg`                  | Format as a Git or Jujutsu commit message (alias `--commit-message`)                       |
+| `--commit-editor[=<CMD>]`       | Edit with `<CMD>` (`$MARKFMT_EDITOR`/`$VISUAL`/`$EDITOR`), then format                     |
+| `--comment-char <CHAR>`         | Commit comment prefix (`#`, `;`, `//`, or `auto`; reads `git config`)                      |
+| `--trailer-separators <CHARS>`  | Commit trailer separators (default from `git config trailer.separators`)                   |
+| `--config <PATH>`               | Use this config file instead of searching for `.markfmt.toml`                              |
+| `--no-config`                   | Do not read `.markfmt.toml` files                                                          |
+| `--exclude <PATTERN>`           | Skip matching files (relative to the current directory; repeatable)                        |
+| `--no-editorconfig`             | Do not read `.editorconfig` files                                                          |
+| `--no-ignore`                   | Do not respect `.gitignore` when traversing directories                                    |
+| `--filter-files`                | Apply Markdown discovery rules to explicitly named files                                   |
+| `--overlaps-git-changes <MODE>` | Only format blocks in `uncommitted`, `staged`/`cached`, `<COMMIT>`, or `A..B`/`A...B`      |
+| `--staged`, `--cached`          | Shorthand for `--overlaps-git-changes=staged`                                              |
+| `--since <REV>`                 | Only format blocks changed in the working tree or untracked since `<REV>`                  |
+| `--git-path <PATH>`             | Explicit path to the `git` executable                                                      |
+| `--lines <RANGE>`               | Only format blocks overlapping 1-based line range(s) on a single file                      |
+| `--stdin-filepath <PATH>`       | Virtual path for config/Markdeep/commit detection (alias `--assume-filename`; implies `-`) |
+| `--stdout`                      | Write formatted output to stdout without modifying files                                   |
+| `--list-ignored`                | Print the given files that are excluded, then exit (for `git-clang-format`)                |
+| `-i`, `--in-place`              | Modify files in place (default; the later of `-i` and `--stdout` wins)                     |
+| `-n`, `--dry-run`               | Print paths of files that would change without modifying them                              |
+| `--check`                       | Verify formatting without modifying files; exit `1` if changes are needed                  |
+| `--diff`                        | Print a unified diff of formatting changes without modifying files                         |
+| `--color <WHEN>`                | Color output and diffs: `auto` (default, terminals only), `always`, `never`                |
+| `-q`, `--quiet`                 | Suppress summary output                                                                    |
+| `-v`, `--verbose`               | Also list each reformatted file                                                            |
+| `--completions <SHELL>`         | Print a `bash`, `zsh`, `fish`, `powershell`, or `elvish` completion script                 |
+| `--man`                         | Print the `markfmt(1)` man page in roff format                                             |
+| `-h`, `--help`                  | Print help information (including the embedded version)                                    |
+| `-V`, `--version`               | Print version information                                                                  |
+| `@<filename>`                   | Read newline-separated arguments/paths from `<filename>`                                   |
 
 ### Exit Codes
 

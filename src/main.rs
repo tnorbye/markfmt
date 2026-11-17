@@ -14,15 +14,14 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Read, Write};
-use std::ops::RangeInclusive;
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use clap::Parser;
 
-use markfmt::cli::{self, Cli};
+use markfmt::cli::{self, Cli, GitChangeMode};
 use markfmt::config::{Config, ConfigResolver, ExcludeSet};
 use markfmt::discovery::{self, InputTarget};
 use markfmt::editorconfig::EditorConfigResolver;
@@ -64,10 +63,28 @@ fn main() {
         }
     }
 
-    if cli.files.is_empty() {
+    if cli.list_ignored {
+        list_ignored(&cli).unwrap_or_else(|err| fail(&err));
+        return;
+    }
+
+    let git_modes = cli.git_change_modes();
+    // Like clang-format, read stdin when no files are given with `--stdin-filepath` or (without
+    // git-change filters, which default to `.`) a clang-format style flag.
+    let implicit_stdin = cli.files.is_empty()
+        && (cli.stdin_filepath.is_some()
+            || (cli.has_clang_format_style_flag() && git_modes.is_empty()))
+        && cli.commit_editor.is_none();
+    let effective_files: Vec<String> = if !cli.files.is_empty() {
+        cli.files.clone()
+    } else if implicit_stdin {
+        vec!["-".to_string()]
+    } else if !git_modes.is_empty() && cli.lines.is_empty() && cli.commit_editor.is_none() {
+        vec![".".to_string()]
+    } else {
         eprintln!("Usage: markfmt [OPTIONS] <FILES>...");
         fail("No input files or directories specified.");
-    }
+    };
 
     let target_files = if cli.commit_editor.is_some() {
         let allowlisted = run_commit_editor(&cli);
@@ -76,7 +93,7 @@ fn main() {
         }
         allowlisted
     } else {
-        cli.files.clone()
+        effective_files
     };
 
     // Reaching here in editor mode means the interactive editor succeeded. Formatting is
@@ -107,16 +124,48 @@ fn main() {
         fail("--lines can only be used with a single input file.");
     }
 
-    let range_filter = if cli.print_config || cli.explain {
+    let only_stdin = !targets.is_empty() && targets.iter().all(|t| matches!(t, InputTarget::Stdin));
+    let write_stdout = cli.write_to_stdout();
+    let single_named_file =
+        target_files.len() == 1 && target_files[0] != "-" && !Path::new(&target_files[0]).is_dir();
+    let line_filter = if cli.print_config || cli.explain {
         RangeFilter::All
     } else {
-        build_range_filter(&cli, &targets).unwrap_or_else(|err| formatting_failure(&err))
+        preflight_range_filter(&cli, &git_modes, &targets)
+            .unwrap_or_else(|err| formatting_failure(&err))
     };
-    let only_stdin = !targets.is_empty() && targets.iter().all(|t| matches!(t, InputTarget::Stdin));
-    let jobs = build_jobs(&cli, &targets).unwrap_or_else(|err| formatting_failure(&err));
+    let jobs = build_jobs(
+        &cli,
+        &targets,
+        implicit_stdin,
+        write_stdout,
+        single_named_file,
+    )
+    .unwrap_or_else(|err| formatting_failure(&err));
     if cli.print_config || cli.explain {
         return;
     }
+    // Built after stdin is read, so git line ranges can be matched to stdin's actual contents.
+    let stdin_input = jobs.iter().find_map(|job| match &job.source {
+        JobSource::Stdin(input) => Some((job.filter_path.as_path(), input.as_str())),
+        JobSource::File { .. } => None,
+    });
+    let range_filter = build_range_filter(&cli, &git_modes, &targets, stdin_input, line_filter)
+        .unwrap_or_else(|err| formatting_failure(&err));
+
+    // Files that no `--lines` or git-change range selects are left alone: not read, linted, or
+    // reported (git-change filters walk the whole repository by default). Writing to stdout
+    // still echoes them, and stdin is always echoed.
+    let jobs: Vec<Job> = if write_stdout {
+        jobs
+    } else {
+        jobs.into_iter()
+            .filter(|job| {
+                matches!(job.source, JobSource::Stdin(_))
+                    || range_filter.includes_file(&job.filter_path)
+            })
+            .collect()
+    };
 
     // Reading and formatting is independent per file, so it runs in parallel; reporting and
     // writing happen afterwards in input order so output stays deterministic.
@@ -126,6 +175,9 @@ fn main() {
             JobSource::File { write_path } => fs::read_to_string(write_path)
                 .map_err(|err| format!("Failed to read `{}`: {err}", job.display_name))?,
         };
+        if job.passthrough {
+            return Ok((input.clone(), input, Vec::new()));
+        }
         let formatted =
             formatter::format_file_content(&input, &job.filter_path, &range_filter, &job.options);
         let warnings = lint::lint_with_options(&input, &job.options);
@@ -149,9 +201,13 @@ fn main() {
             ));
         }
         let changed = formatted != input;
-        match report_or_write(&cli, job, &input, &formatted, changed) {
+        // A file that no `--lines` or git-change range selects is still written to stdout as
+        // is, but not counted: the summary covers the files that were formatted.
+        let selected = range_filter.includes_file(&job.filter_path);
+        match report_or_write(&cli, write_stdout, job, &input, &formatted, changed) {
             Ok(()) if changed => counts.changed += 1,
-            Ok(()) => counts.unchanged += 1,
+            Ok(()) if selected => counts.unchanged += 1,
+            Ok(()) => {}
             Err(err) => {
                 report_formatting_error(&cli, &err);
                 counts.failed += 1;
@@ -159,12 +215,13 @@ fn main() {
         }
     }
 
-    // Formatting stdin (as editors do) or commit messages prints no summary unless `-v` is set.
+    // Formatting stdin, writing formatted output to stdout, or formatting commit messages prints
+    // no summary unless `-v` is set.
     let quiet_commit = !jobs.is_empty()
         && jobs.iter().all(|j| j.options.commit_message)
         && !cli.verbose
         && !cli.check;
-    if !only_stdin && !cli.quiet && !quiet_commit {
+    if !only_stdin && !write_stdout && !cli.quiet && !quiet_commit {
         if cli.check {
             counts.print_check_summary();
         } else if !cli.diff && !cli.dry_run {
@@ -189,6 +246,54 @@ fn report_formatting_error(cli: &Cli, message: &str) {
     }
 }
 
+/// Prints each of `cli.files` that `--exclude` or `.markfmt.toml` excludes, as given, one per
+/// line (`clang-format -list-ignored`, which `git-clang-format` runs before formatting, possibly
+/// with no files). As in formatting, commit messages skip `.markfmt.toml` excludes, but
+/// `--exclude` still applies to them.
+fn list_ignored(cli: &Cli) -> Result<(), String> {
+    let cwd =
+        std::env::current_dir().map_err(|err| format!("Cannot read current directory: {err}"))?;
+    let mut configs = match &cli.config {
+        Some(path) => Some(ConfigResolver::with_explicit(&cwd, Path::new(path))?),
+        None if cli.no_config => None,
+        None => Some(ConfigResolver::new()),
+    };
+    let cli_excludes = ExcludeSet::new(&cwd, &cli.exclude)?;
+    let mut out = io::stdout().lock();
+    for file in &cli.files {
+        let path = Path::new(file);
+        let abs_path = markfmt::config::normalized_path_in(&cwd, path);
+        let canonical = fs::canonicalize(path).ok();
+        let probe_paths: Vec<&Path> = std::iter::once(path).chain(canonical.as_deref()).collect();
+        let ignored = if cli_excludes.matches(&abs_path) {
+            true
+        } else if is_commit_target(cli, &probe_paths) {
+            false
+        } else {
+            match configs.as_mut() {
+                Some(resolver) => resolver
+                    .for_file(&abs_path)?
+                    .is_some_and(|config| config.excludes(&abs_path)),
+                None => false,
+            }
+        };
+        if ignored {
+            writeln!(out, "{file}").map_err(|err| format!("Failed to write stdout: {err}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether a target is formatted as a commit message: `--commit-msg`, or any of its
+/// `probe_paths` (the path as given and, for files, the symlink-resolved path) has a commit
+/// message file name.
+fn is_commit_target(cli: &Cli, probe_paths: &[&Path]) -> bool {
+    cli.commit_msg
+        || probe_paths
+            .iter()
+            .any(|p| discovery::is_commit_message_path(p))
+}
+
 /// One input to format, with its resolved options.
 struct Job {
     source: JobSource,
@@ -196,6 +301,9 @@ struct Job {
     /// Path used to look up line-range filters (canonical for files).
     filter_path: PathBuf,
     options: FormattingOptions,
+    /// Excluded input echoed unchanged (a single named file in stdout mode, or a stdin blob from
+    /// `git-clang-format`), so the wrapper never formats it or reads empty output as the file.
+    passthrough: bool,
 }
 
 enum JobSource {
@@ -204,10 +312,16 @@ enum JobSource {
 }
 
 /// Resolves options for every target up front (sequentially, so the `.editorconfig` and
-/// `.markfmt.toml` caches are shared), drops excluded files, and reads stdin if requested.
+/// `.markfmt.toml` caches are shared), drops excluded files, and then reads stdin if requested.
 ///
 /// Option precedence: command-line flags, then `.markfmt.toml`, then `.editorconfig`.
-fn build_jobs(cli: &Cli, targets: &[InputTarget]) -> Result<Vec<Job>, String> {
+fn build_jobs(
+    cli: &Cli,
+    targets: &[InputTarget],
+    implicit_stdin: bool,
+    write_stdout: bool,
+    single_named_file: bool,
+) -> Result<Vec<Job>, String> {
     let cwd =
         std::env::current_dir().map_err(|err| format!("Cannot read current directory: {err}"))?;
     let absolute = |p: &Path| markfmt::config::normalized_path_in(&cwd, p);
@@ -229,10 +343,7 @@ fn build_jobs(cli: &Cli, targets: &[InputTarget]) -> Result<Vec<Job>, String> {
                        apply_excludes: bool|
      -> Result<(FormattingOptions, bool), String> {
         let abs_path = absolute(path);
-        let is_commit = cli.commit_msg
-            || probe_paths
-                .iter()
-                .any(|p| discovery::is_commit_message_path(p));
+        let is_commit = is_commit_target(cli, probe_paths);
         let cfg_path = if is_commit {
             commit_config_path(cli.git_path.as_deref(), &cwd, &abs_path)
         } else {
@@ -375,21 +486,27 @@ fn build_jobs(cli: &Cli, targets: &[InputTarget]) -> Result<Vec<Job>, String> {
     for target in targets {
         match target {
             InputTarget::Stdin => {
-                let mut input = String::new();
-                if !cli.print_config && !cli.explain {
-                    io::stdin()
-                        .read_to_string(&mut input)
-                        .map_err(|err| format!("Failed to read stdin: {err}"))?;
-                }
+                // Read after every target's options resolve, so configuration errors don't wait
+                // for stdin's EOF.
+                let input = String::new();
                 let virtual_path = cli.stdin_filepath.as_deref().map(Path::new);
                 let markdeep_paths: Vec<&Path> = virtual_path.into_iter().collect();
                 // Without a virtual path, use the config that applies to the current directory.
                 let config_path =
                     virtual_path.map_or_else(|| cwd.join("<stdin>"), Path::to_path_buf);
-                // Stdin is formatted even if its virtual path matches an exclude pattern.
-                let (options, _) =
-                    resolve(&config_path, &markdeep_paths, virtual_path.is_some(), false)?;
+                // Stdin is formatted even if its virtual path matches an exclude pattern, except
+                // under `git-clang-format` (`--staged` and two-commit modes pipe blobs): current
+                // versions drop excluded files via `--list-ignored`, but older ones do not, so
+                // echo them unchanged as working-tree mode does.
+                let wrapper_blob = virtual_path.is_some() && cli::is_git_clang_format_index();
+                let (options, excluded) = resolve(
+                    &config_path,
+                    &markdeep_paths,
+                    virtual_path.is_some(),
+                    wrapper_blob,
+                )?;
                 jobs.push(Job {
+                    passthrough: excluded,
                     options,
                     filter_path: virtual_path
                         .map(canonical_or_abs)
@@ -410,16 +527,21 @@ fn build_jobs(cli: &Cli, targets: &[InputTarget]) -> Result<Vec<Job>, String> {
                 if cli.print_config || cli.explain {
                     continue;
                 }
-                if excluded {
+                // A single named excluded file printed to stdout (as `git-clang-format` asks
+                // for) is echoed unchanged, since empty output would read as an emptied file.
+                // Folder walks never echo excluded files.
+                let passthrough = excluded && write_stdout && single_named_file;
+                if excluded && !passthrough {
                     if cli.verbose && !cli.quiet {
                         anstream::eprintln!("Skipping excluded {}", display_path.display());
                     }
                     continue;
                 }
                 jobs.push(Job {
+                    passthrough,
                     options,
                     filter_path: write_path.clone(),
-                    display_name: display_path.display().to_string(),
+                    display_name: report::path_label(&display_path.display().to_string()),
                     source: JobSource::File {
                         write_path: write_path.clone(),
                     },
@@ -427,13 +549,30 @@ fn build_jobs(cli: &Cli, targets: &[InputTarget]) -> Result<Vec<Job>, String> {
             }
         }
     }
+    if !cli.print_config && !cli.explain {
+        if let Some(JobSource::Stdin(input)) = jobs
+            .iter_mut()
+            .map(|job| &mut job.source)
+            .find(|source| matches!(source, JobSource::Stdin(_)))
+        {
+            if implicit_stdin && !cli.quiet && io::stdin().is_terminal() {
+                report::warning(
+                    "Reading from stdin because --stdin-filepath/--assume-filename or a clang-format style flag was given without input files",
+                );
+            }
+            io::stdin()
+                .read_to_string(input)
+                .map_err(|err| format!("Failed to read stdin: {err}"))?;
+        }
+    }
     Ok(jobs)
 }
 
 /// Prints the diff / dry-run / check output for one job, or writes the formatted result
-/// (to stdout for stdin, otherwise back to the file).
+/// (to stdout for stdin or `--stdout`, otherwise back to the file).
 fn report_or_write(
     cli: &Cli,
+    write_stdout: bool,
     job: &Job,
     input: &str,
     formatted: &str,
@@ -462,6 +601,12 @@ fn report_or_write(
             }
         }
         JobSource::File { write_path } => {
+            if write_stdout {
+                io::stdout()
+                    .write_all(formatted.as_bytes())
+                    .map_err(|err| format!("Failed to write stdout: {err}"))?;
+                return Ok(());
+            }
             if !changed {
                 return Ok(());
             }
@@ -545,67 +690,105 @@ fn canonical_or_abs(path: &Path) -> PathBuf {
     if let Ok(c) = fs::canonicalize(path) {
         return c;
     }
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map(|cwd| cwd.join(path))
-            .unwrap_or_else(|_| path.to_path_buf())
+    let normalized = markfmt::config::normalized_path(path);
+    let mut suffix = Vec::new();
+    let mut cur: &Path = &normalized;
+    while let Some(parent) = cur.parent() {
+        let Some(name) = cur.file_name() else {
+            break;
+        };
+        suffix.push(name.to_os_string());
+        if let Ok(canon_parent) = fs::canonicalize(parent) {
+            let mut result = canon_parent;
+            for comp in suffix.into_iter().rev() {
+                result.push(comp);
+            }
+            return result;
+        }
+        cur = parent;
     }
+    normalized
 }
 
-fn build_range_filter(cli: &Cli, targets: &[InputTarget]) -> Result<RangeFilter, String> {
+/// The `--lines` filter and the checks on git-change filtering that don't depend on stdin's
+/// contents, so they fail before stdin is read (an editor piping a buffer would otherwise wait
+/// for EOF to see the error).
+fn preflight_range_filter(
+    cli: &Cli,
+    git_modes: &[GitChangeMode],
+    targets: &[InputTarget],
+) -> Result<RangeFilter, String> {
     let mut combined = RangeFilter::All;
+    let stdin_path = cli
+        .stdin_filepath
+        .as_deref()
+        .map(|p| canonical_or_abs(Path::new(p)));
 
     if !cli.lines.is_empty() {
         let target_path = match &targets[0] {
             InputTarget::File { write_path, .. } => write_path.clone(),
-            InputTarget::Stdin => cli
-                .stdin_filepath
-                .as_deref()
-                .map(|p| canonical_or_abs(Path::new(p)))
+            InputTarget::Stdin => stdin_path
+                .clone()
                 .unwrap_or_else(|| PathBuf::from("<stdin>")),
         };
         let line_filter = RangeFilter::from_line_strings(&target_path, &cli.lines)?;
-        combined = merge_range_filters(combined, line_filter);
+        combined = combined.intersect(line_filter);
     }
 
-    if !cli.overlaps_git_changes.is_empty() {
-        let anchor = targets
-            .iter()
-            .find_map(|t| match t {
-                InputTarget::File { display_path, .. } => Some(display_path.clone()),
-                InputTarget::Stdin => None,
-            })
-            .or_else(|| cli.stdin_filepath.as_deref().map(PathBuf::from))
-            .unwrap_or_else(|| PathBuf::from("."));
-
-        if targets.iter().any(|t| matches!(t, InputTarget::Stdin)) && cli.stdin_filepath.is_none() {
-            return Err("--overlaps-git-changes with stdin requires --stdin-filepath".to_string());
+    if !git_modes.is_empty() && targets.iter().any(|t| matches!(t, InputTarget::Stdin)) {
+        let Some(stdin_path) = stdin_path else {
+            return Err(
+                "Git change filtering with stdin requires --stdin-filepath (or --assume-filename)"
+                    .to_string(),
+            );
+        };
+        // Stdin's ranges are matched to its own contents, so they cannot also apply to the
+        // file on disk that shares its path.
+        let clash = targets.iter().find_map(|t| match t {
+            InputTarget::File {
+                display_path,
+                write_path,
+            } if *write_path == stdin_path => Some(display_path),
+            _ => None,
+        });
+        if let Some(path) = clash {
+            return Err(format!(
+                "Git change filtering cannot format stdin and `{}` (its --stdin-filepath) in one run",
+                path.display()
+            ));
         }
-
-        let git_filter = RangeFilter::from_git_changes(
-            cli.git_path.as_deref(),
-            &anchor,
-            &cli.overlaps_git_changes,
-        )?;
-        combined = merge_range_filters(combined, git_filter);
     }
 
     Ok(combined)
 }
 
-fn merge_range_filters(a: RangeFilter, b: RangeFilter) -> RangeFilter {
-    match (a, b) {
-        (RangeFilter::All, other) | (other, RangeFilter::All) => other,
-        (RangeFilter::LineRanges(mut m1), RangeFilter::LineRanges(m2)) => {
-            let mut merged: HashMap<PathBuf, Vec<RangeInclusive<usize>>> = std::mem::take(&mut m1);
-            for (k, mut v) in m2 {
-                merged.entry(k).or_default().append(&mut v);
-            }
-            RangeFilter::LineRanges(merged)
-        }
+/// Intersects `line_filter` (from [`preflight_range_filter`]) with the git-change filter, whose
+/// stdin ranges are matched to stdin's contents.
+fn build_range_filter(
+    cli: &Cli,
+    git_modes: &[GitChangeMode],
+    targets: &[InputTarget],
+    stdin_input: Option<(&Path, &str)>,
+    line_filter: RangeFilter,
+) -> Result<RangeFilter, String> {
+    if git_modes.is_empty() {
+        return Ok(line_filter);
     }
+    let anchor = targets
+        .iter()
+        .find_map(|t| match t {
+            InputTarget::File { write_path, .. } => Some(write_path.clone()),
+            InputTarget::Stdin => None,
+        })
+        .or_else(|| {
+            cli.stdin_filepath
+                .as_deref()
+                .map(|p| canonical_or_abs(Path::new(p)))
+        })
+        .unwrap_or_else(|| PathBuf::from("."));
+    let git_filter =
+        RangeFilter::from_git_changes(cli.git_path.as_deref(), &anchor, git_modes, stdin_input)?;
+    Ok(line_filter.intersect(git_filter))
 }
 
 /// The Git settings that change how a commit message is read.
@@ -700,7 +883,10 @@ fn commit_config_path(git_path: Option<&str>, cwd: &Path, abs_path: &Path) -> Pa
 /// nothing when outside a Git repository or if `git` is unavailable.
 fn detect_git_commit_config(git_path: Option<&str>, dir: &Path) -> GitCommitConfig {
     let mut detected = GitCommitConfig::default();
-    let Ok(output) = process::Command::new(git_path.unwrap_or("git"))
+    let git_bin = Path::new(git_path.unwrap_or("git"));
+    let mut cmd = process::Command::new(git_bin);
+    markfmt::range_filter::apply_git_location_env(&mut cmd, git_bin, dir);
+    let Ok(output) = cmd
         .arg("-C")
         .arg(dir)
         .args([
