@@ -17,8 +17,8 @@
 # Agent Instructions
 
 `markfmt` is a Rust CLI and library that reflows and formats Markdown,
-Markdeep, and AI agent instruction files. See [README.md](README.md) for
-user-facing behavior.
+Markdeep, AI agent instruction files, and Git/Jujutsu commit messages.
+See [README.md](README.md) for user-facing behavior.
 
 ## Before Finishing Any Change
 
@@ -41,7 +41,11 @@ change must keep both of these true:
   and whether the file ends with a newline doesn't change
   (unless `.editorconfig` sets `insert_final_newline`). See
   [tests/line_endings_test.rs](tests/line_endings_test.rs); add new
-  block types to its `CASES`.
+  block types to its `CASES` (or `COMMIT_CASES`).
+- **Commit-metadata-preserving** (`commit_message` mode):
+  `git stripspace -s` is unchanged apart from reflow whitespace, and
+  `git interpret-trailers --parse` is byte-for-byte identical before and
+  after formatting.
 
 [tests/roundtrip_test.rs](tests/roundtrip_test.rs) checks both over
 generated paragraphs full of "hazard" words. When you fix a case where
@@ -55,26 +59,28 @@ break before them.
 ## Code Map
 
 - [src/main.rs](src/main.rs): CLI driver (job setup, parallel
-  formatting, atomic writes).
+  formatting, atomic writes, `--commit-editor`, and Git commit
+  configuration lookup).
 - [src/report.rs](src/report.rs): terminal output (summaries, styled
   errors and warnings, colored word-highlighted diffs). Messages go
   through `anstream`; formatted document content never does, so it is
   written byte-for-byte.
 - [src/cli.rs](src/cli.rs): `clap` definitions and `@file` argument
   expansion.
-- [src/discovery.rs](src/discovery.rs): directory walking and Markdown
-  file detection.
+- [src/discovery.rs](src/discovery.rs): directory walking, Markdown file
+  detection, and commit-message path detection.
 - [src/editorconfig.rs](src/editorconfig.rs): `.editorconfig`
   resolution.
-- [src/config.rs](src/config.rs): `.markfmt.toml` loading and `exclude`
-  pattern matching.
+- [src/config.rs](src/config.rs): `.markfmt.toml` loading (including
+  `[commit_message]` settings) and `exclude` pattern matching.
 - [src/lint.rs](src/lint.rs): warnings that never change output (such as
   `|` inside a code span in a table).
 - [src/range_filter.rs](src/range_filter.rs): `--lines` and
   `--overlaps-git-changes` filtering.
 - [src/preprocess.rs](src/preprocess.rs): splits a document into
   segments the CommonMark parser should not see directly (frontmatter,
-  ignore directives, display math, Markdeep constructs, prompt tags).
+  ignore directives, display math, Markdeep constructs, prompt tags, and
+  commit-message subjects, trailers, and comment lines).
 - [src/formatter.rs](src/formatter.rs): formats each top-level block
   from the `pulldown-cmark` AST, recursing into lists, blockquotes, and
   footnotes.

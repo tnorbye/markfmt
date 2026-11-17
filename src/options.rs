@@ -190,6 +190,32 @@ pub struct FormattingOptions {
     pub insert_final_newline: Option<bool>,
     /// Force Markdeep mode on or off; `None` detects it from the content.
     pub markdeep: Option<bool>,
+    /// Format as a Git or Jujutsu commit message (default `false`): keep a single-line opening
+    /// subject verbatim, preserve trailers (`Change-Id:`, `Signed-off-by:`, `Bug:`, `Test:`,
+    /// ...), preserve comment lines and scissors diffs, and avoid creating comment, trailer, or
+    /// `git am` patch-break lines when wrapping.
+    pub commit_message: bool,
+    /// Comment line prefix in commit-message mode (default `"#"`), matching Git's
+    /// `core.commentString` / `core.commentChar` (including `"auto"`).
+    pub comment_char: String,
+    /// Characters that separate a trailer's key from its value in commit-message mode (default
+    /// `":"`), matching Git's `trailer.separators`.
+    pub trailer_separators: String,
+    /// Names and `key` values of the trailers configured in Git (`trailer.<name>.key`), which
+    /// Git recognizes like `Signed-off-by:` when deciding whether a paragraph is a trailer block.
+    pub trailer_keys: Vec<String>,
+}
+
+impl FormattingOptions {
+    /// The commit-message syntax for these options, if commit-message mode is on.
+    pub(crate) fn commit_syntax(&self) -> Option<crate::preprocess::CommitSyntax<'_>> {
+        self.commit_message
+            .then(|| crate::preprocess::CommitSyntax {
+                comment_prefix: &self.comment_char,
+                trailer_separators: &self.trailer_separators,
+                trailer_keys: &self.trailer_keys,
+            })
+    }
 }
 
 impl Default for FormattingOptions {
@@ -206,6 +232,10 @@ impl Default for FormattingOptions {
             line_ending: LineEnding::Auto,
             insert_final_newline: None,
             markdeep: None,
+            commit_message: false,
+            comment_char: "#".to_string(),
+            trailer_separators: ":".to_string(),
+            trailer_keys: Vec::new(),
         }
     }
 }
@@ -220,6 +250,8 @@ pub struct CliOverrides {
     pub optimal: Option<bool>,
     pub wrap: Option<WrapMode>,
     pub ordered_lists: Option<OrderedListStyle>,
+    pub comment_char: Option<String>,
+    pub trailer_separators: Option<String>,
 }
 
 impl CliOverrides {
@@ -241,6 +273,12 @@ impl CliOverrides {
         }
         if let Some(style) = self.ordered_lists {
             options.ordered_lists = style;
+        }
+        if let Some(prefix) = &self.comment_char {
+            options.comment_char.clone_from(prefix);
+        }
+        if let Some(separators) = &self.trailer_separators {
+            options.trailer_separators.clone_from(separators);
         }
     }
 }

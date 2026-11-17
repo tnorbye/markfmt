@@ -27,6 +27,8 @@ pub enum PreSegment {
         range: Range<usize>,
         start_line: usize,
         end_line: usize,
+        tight_before: bool,
+        tight_after: bool,
     },
     StandaloneLine {
         text: String,
@@ -56,6 +58,20 @@ pub enum PreSegment {
         range: Range<usize>,
         start_line: usize,
     },
+}
+
+impl PreSegment {
+    /// The byte range of the source this segment covers.
+    fn range(&self) -> Range<usize> {
+        match self {
+            PreSegment::Frontmatter { range, .. }
+            | PreSegment::Verbatim { range, .. }
+            | PreSegment::StandaloneLine { range, .. }
+            | PreSegment::Admonition { range, .. }
+            | PreSegment::DefinitionList { range, .. }
+            | PreSegment::MarkdownChunk { range, .. } => range.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -220,20 +236,88 @@ pub fn dedent_columns(line: &str, target_cols: usize, tab_width: usize) -> Strin
     line[idx..].to_string()
 }
 
-pub fn preprocess(text: &str, is_root: bool, is_markdeep: bool) -> Vec<PreSegment> {
+pub fn preprocess(
+    text: &str,
+    is_root: bool,
+    is_markdeep: bool,
+    commit: Option<CommitSyntax<'_>>,
+) -> Vec<PreSegment> {
     let tab_width = TAB_STOP;
-    let (hard_protected, soft_protected) = protected_ranges(text);
-    let raw_text = Intervals::new(raw_text_regions(text));
     let lines = split_line_spans(text);
     if lines.is_empty() {
         return Vec::new();
     }
+    let frontmatter_end = if is_root {
+        root_frontmatter_end(&lines, commit)
+    } else {
+        None
+    };
+    let body_offset = match frontmatter_end {
+        Some(end) => lines.get(end + 1).map_or(text.len(), |line| line.start),
+        None => 0,
+    };
+    let (hard_protected, soft_protected, top_blocks) =
+        protected_ranges_from(&text[body_offset..], body_offset);
+    let raw_text = Intervals::new(
+        raw_text_regions(&text[body_offset..])
+            .into_iter()
+            .map(|r| (r.start + body_offset)..(r.end + body_offset))
+            .collect(),
+    );
 
     let mut segments: Vec<PreSegment> = Vec::new();
     let mut chunk_start_idx: Option<usize> = None;
     let mut chunk_last_non_blank: Option<usize> = None;
     let mut fence: Option<FenceState> = None;
     let mut idx = 0usize;
+    let mut block_start = 0usize;
+    // The opening commit subject is the first non-blank, non-comment line (matching `git
+    // stripspace -s`), even after leading blank lines or template comments.
+    let commit_subject_idx = commit
+        .filter(|_| is_root && frontmatter_end.is_none())
+        .and_then(|commit| {
+            let first = lines.iter().position(|l| {
+                !l.is_blank && !is_commit_comment_line(l.raw, commit.comment_prefix)
+            })?;
+            let spans_past_subject = raw_text
+                .containing(lines[first].start)
+                .is_some_and(|r| r.end > lines[first].end_excl + 1);
+            (!spans_past_subject
+                && is_single_line_commit_subject_at(&lines, first, commit.comment_prefix))
+            .then_some(first)
+        });
+    // Git looks for trailers only above the first `---` patch divider line.
+    let trailer_search_end = if commit.is_some() && is_root {
+        lines
+            .iter()
+            .position(|line| is_git_patch_divider(line.raw))
+            .unwrap_or(lines.len())
+    } else {
+        lines.len()
+    };
+    // The lines Git reads as the trailer block (`trailer.c`). Whatever they start with (a list
+    // item, a quote), reflowing them could change Git's count of trailer and other lines, so
+    // they are kept as written.
+    let final_trailer_block = commit.filter(|_| is_root).and_then(|commit| {
+        let raw: Vec<&str> = lines.iter().map(|l| l.raw).collect();
+        let candidate = find_git_trailer_candidate(&raw, commit).filter(|c| c.is_block)?;
+        let start = candidate.lines.start;
+        let end = candidate.lines.rev().find(|&i| !lines[i].is_blank)?;
+        Some((start, end))
+    });
+    // An old-style `Conflicts:` footer that Git skips when finding trailers: joining its
+    // tab-indented paths onto `Conflicts:` would make it a trailer, so it stays as written.
+    let conflicts_footer = commit.filter(|_| is_root).and_then(|commit| {
+        let raw: Vec<&str> = lines.iter().map(|l| l.raw).collect();
+        let log_end = git_log_message_end(&raw, commit);
+        if !log_end.has_conflicts {
+            return None;
+        }
+        let footer = log_end.end..log_end.cutoff;
+        let start = footer.clone().find(|&i| !lines[i].is_blank)?;
+        let end = footer.rev().find(|&i| !lines[i].is_blank)?;
+        Some((start, end))
+    });
 
     let flush_chunk = |segments: &mut Vec<PreSegment>,
                        chunk_start: &mut Option<usize>,
@@ -254,14 +338,25 @@ pub fn preprocess(text: &str, is_root: bool, is_markdeep: bool) -> Vec<PreSegmen
         range: lines[start_i].start..lines[end_i].end_excl,
         start_line: lines[start_i].line_no,
         end_line: lines[end_i].line_no,
+        tight_before: false,
+        tight_after: false,
+    };
+    // Commit-message lines kept verbatim inside the surrounding text, recording whether they
+    // touch it without a blank line in between so rendering keeps them attached.
+    let attached_verbatim = |start_i: usize, end_i: usize| PreSegment::Verbatim {
+        range: lines[start_i].start..lines[end_i].end_excl,
+        start_line: lines[start_i].line_no,
+        end_line: lines[end_i].line_no,
+        tight_before: start_i > 0 && !lines[start_i - 1].is_blank,
+        tight_after: lines.get(end_i + 1).is_some_and(|next| !next.is_blank),
     };
 
     while idx < lines.len() {
         let line = lines[idx];
 
-        // 1. Root-level line 1 frontmatter and Markdeep title header.
+        // 1. Root-level frontmatter or Markdeep title header on line 1, or opening commit subject.
         if is_root && idx == 0 {
-            if let Some(end_idx) = match_frontmatter(&lines) {
+            if let Some(end_idx) = frontmatter_end {
                 segments.push(PreSegment::Frontmatter {
                     range: lines[0].start..lines[end_idx].end_excl,
                     start_line: lines[0].line_no,
@@ -270,13 +365,24 @@ pub fn preprocess(text: &str, is_root: bool, is_markdeep: bool) -> Vec<PreSegmen
                 idx = end_idx + 1;
                 continue;
             }
-            if is_markdeep {
+            if is_markdeep && commit_subject_idx.is_none() {
                 if let Some(end_idx) = match_markdeep_title_block(&lines) {
                     segments.push(verbatim(0, end_idx));
                     idx = end_idx + 1;
                     continue;
                 }
             }
+        }
+        if commit_subject_idx == Some(idx) {
+            flush_chunk(
+                &mut segments,
+                &mut chunk_start_idx,
+                &mut chunk_last_non_blank,
+            );
+            block_start = idx;
+            segments.push(attached_verbatim(idx, idx));
+            idx += 1;
+            continue;
         }
 
         if let Some(region) = raw_text.containing(line.start) {
@@ -285,11 +391,18 @@ pub fn preprocess(text: &str, is_root: bool, is_markdeep: bool) -> Vec<PreSegmen
                 &mut chunk_start_idx,
                 &mut chunk_last_non_blank,
             );
-            let end_idx = (idx..lines.len())
+            let Some(start_idx) = (idx..lines.len())
+                .take_while(|&i| lines[i].start < region.end)
+                .find(|&i| !lines[i].is_blank)
+            else {
+                idx += 1;
+                continue;
+            };
+            let end_idx = (start_idx..lines.len())
                 .take_while(|&i| lines[i].start < region.end)
                 .last()
-                .unwrap_or(idx);
-            segments.push(verbatim(idx, end_idx));
+                .unwrap_or(start_idx);
+            segments.push(verbatim(start_idx, end_idx));
             idx = end_idx + 1;
             continue;
         }
@@ -305,6 +418,167 @@ pub fn preprocess(text: &str, is_root: bool, is_markdeep: bool) -> Vec<PreSegmen
                 idx = end_idx + 1;
                 continue;
             }
+        }
+
+        // Inside an active code fence: track close fence, never match directives or comments.
+        if let Some(f) = fence {
+            if chunk_start_idx.is_none() {
+                chunk_start_idx = Some(idx);
+            }
+            chunk_last_non_blank = Some(idx);
+            if is_fence_close(line.raw, f.ch, f.count) {
+                fence = None;
+            }
+            idx += 1;
+            continue;
+        }
+
+        if let Some((start, end)) = conflicts_footer.filter(|&(start, _)| start == idx) {
+            if !hard_protected.overlaps(line.start, line.start) {
+                // A footer attached to the block above is part of it for CommonMark (a lazy
+                // paragraph continuation, say), so keep that whole block as written too:
+                // formatting it alone would parse it in a different context.
+                let first = if start > 0 && !lines[start - 1].is_blank {
+                    rewind_to_block(
+                        &mut segments,
+                        &mut chunk_start_idx,
+                        &mut chunk_last_non_blank,
+                        &lines,
+                        block_start,
+                        idx,
+                    )
+                } else {
+                    flush_chunk(
+                        &mut segments,
+                        &mut chunk_start_idx,
+                        &mut chunk_last_non_blank,
+                    );
+                    start
+                };
+                segments.push(attached_verbatim(first, end));
+                idx = end + 1;
+                continue;
+            }
+        }
+        if let Some((start, end)) = final_trailer_block.filter(|&(start, _)| start == idx) {
+            if !hard_protected.overlaps(line.start, line.start) {
+                flush_chunk(
+                    &mut segments,
+                    &mut chunk_start_idx,
+                    &mut chunk_last_non_blank,
+                );
+                segments.push(attached_verbatim(start, end));
+                idx = end + 1;
+                continue;
+            }
+        }
+
+        // Where the current top-level block starts, so a block can be kept whole below.
+        if is_root
+            && !line.is_blank
+            && (idx == 0 || lines[idx - 1].is_blank)
+            && !line.raw.starts_with([' ', '\t'])
+            && !hard_protected.overlaps(line.start, line.start)
+        {
+            block_start = idx;
+        }
+
+        // Commit-message comment lines (`# ...`, `; ...`, `JJ: ...`) at column 0.
+        if let Some(comment_prefix) = commit.map(|c| c.comment_prefix).filter(|_| is_root) {
+            if !line.is_blank && is_commit_comment_line(line.raw, comment_prefix) {
+                let mut end_idx = idx;
+                while lines.get(end_idx + 1).is_some_and(|next| {
+                    !next.is_blank && is_commit_comment_line(next.raw, comment_prefix)
+                }) {
+                    end_idx += 1;
+                }
+                let attached = (idx > 0 && !lines[idx - 1].is_blank)
+                    || lines.get(end_idx + 1).is_some_and(|next| !next.is_blank);
+                if attached {
+                    // CommonMark reads the comment as part of the text around it (a paragraph,
+                    // list item, or code span), while Git strips it and joins what remains. No
+                    // reflow is safe for both readings, so keep the whole block as written.
+                    let block_first = rewind_to_block(
+                        &mut segments,
+                        &mut chunk_start_idx,
+                        &mut chunk_last_non_blank,
+                        &lines,
+                        block_start,
+                        idx,
+                    );
+                    let mut block_last = commit_block_end(&lines, end_idx, &hard_protected);
+                    // An armored block (a PGP signature) that starts in it is kept whole too,
+                    // through the CommonMark block attached after its closing line.
+                    let mut i = end_idx + 1;
+                    while i <= block_last {
+                        if let Some(close_idx) = match_armored_block(&lines, i) {
+                            let limit = if close_idx < trailer_search_end
+                                && trailer_search_end < lines.len()
+                            {
+                                lines[trailer_search_end].start
+                            } else {
+                                text.len()
+                            };
+                            let armor_end = extend_armored_block_end(
+                                text,
+                                &lines,
+                                i,
+                                close_idx,
+                                limit,
+                                comment_prefix,
+                                &hard_protected,
+                            );
+                            block_last = block_last.max(armor_end);
+                            i = armor_end;
+                        }
+                        i += 1;
+                    }
+                    segments.push(attached_verbatim(block_first, block_last));
+                    idx = block_last + 1;
+                    continue;
+                }
+                if !hard_protected.overlaps(line.start, line.start) {
+                    // A comment between blank lines stays as it is without CommonMark turning
+                    // `# ...` into an ATX heading.
+                    flush_chunk(
+                        &mut segments,
+                        &mut chunk_start_idx,
+                        &mut chunk_last_non_blank,
+                    );
+                    segments.push(attached_verbatim(idx, end_idx));
+                    idx = end_idx + 1;
+                    // Indented lines after the comment continue a list item or quote opened
+                    // above it (Git strips the comment and rejoins them). Formatted on their own
+                    // they would lose that indentation, so keep them as they are.
+                    if let Some(run_end) = indented_run_end(&lines, idx) {
+                        let run_start = (idx..=run_end)
+                            .find(|&i| !lines[i].is_blank)
+                            .unwrap_or(run_end);
+                        segments.push(attached_verbatim(run_start, run_end));
+                        idx = run_end + 1;
+                    }
+                    continue;
+                }
+            }
+        }
+
+        // A `---` patch divider line stays as it is: below a paragraph CommonMark reads it as a
+        // setext underline, and widening it would move the end of Git's trailer search (the
+        // first one) or change the message text Git keeps (any one). Inside a code span or other
+        // literal it is literal text, which reflow keeps at a line start.
+        if commit.is_some()
+            && is_root
+            && is_git_patch_divider(line.raw)
+            && !hard_protected.overlaps(line.start, line.start)
+        {
+            flush_chunk(
+                &mut segments,
+                &mut chunk_start_idx,
+                &mut chunk_last_non_blank,
+            );
+            segments.push(attached_verbatim(idx, idx));
+            idx += 1;
+            continue;
         }
 
         // Containers are preprocessed after their markers have been removed by the formatter.
@@ -325,19 +599,6 @@ pub fn preprocess(text: &str, is_root: bool, is_markdeep: bool) -> Vec<PreSegmen
         {
             chunk_start_idx.get_or_insert(idx);
             chunk_last_non_blank = Some(idx);
-            idx += 1;
-            continue;
-        }
-
-        // 2. Inside active code fence: track close fence, never match directives.
-        if let Some(f) = fence {
-            if chunk_start_idx.is_none() {
-                chunk_start_idx = Some(idx);
-            }
-            chunk_last_non_blank = Some(idx);
-            if is_fence_close(line.raw, f.ch, f.count) {
-                fence = None;
-            }
             idx += 1;
             continue;
         }
@@ -401,6 +662,78 @@ pub fn preprocess(text: &str, is_root: bool, is_markdeep: bool) -> Vec<PreSegmen
                 continue;
             }
 
+            // Commit-message armored signatures and trailers (root level only).
+            if let Some(commit) = commit.filter(|_| is_root) {
+                if let Some(close_idx) = match_armored_block(&lines, idx) {
+                    let starts_armor = starts_block
+                        || chunk_start_idx.is_some_and(|chunk_start| {
+                            starts_top_level_paragraph(
+                                &text[lines[chunk_start].start..],
+                                line.start - lines[chunk_start].start,
+                                content_start - lines[chunk_start].start,
+                            )
+                        });
+                    if starts_armor {
+                        let limit =
+                            if close_idx < trailer_search_end && trailer_search_end < lines.len() {
+                                lines[trailer_search_end].start
+                            } else {
+                                text.len()
+                            };
+                        let end_idx = extend_armored_block_end(
+                            text,
+                            &lines,
+                            idx,
+                            close_idx,
+                            limit,
+                            commit.comment_prefix,
+                            &hard_protected,
+                        );
+                        flush_chunk(
+                            &mut segments,
+                            &mut chunk_start_idx,
+                            &mut chunk_last_non_blank,
+                        );
+                        segments.push(attached_verbatim(idx, end_idx));
+                        idx = end_idx + 1;
+                        continue;
+                    }
+                }
+                if starts_block {
+                    if let Some(end_idx) =
+                        match_commit_trailer_block(&lines, idx, commit, trailer_search_end)
+                    {
+                        flush_chunk(
+                            &mut segments,
+                            &mut chunk_start_idx,
+                            &mut chunk_last_non_blank,
+                        );
+                        segments.push(attached_verbatim(idx, end_idx));
+                        idx = end_idx + 1;
+                        continue;
+                    }
+                } else if chunk_last_non_blank == Some(idx - 1)
+                    && !ends_with_markdown_hard_break(lines[idx - 1].raw)
+                {
+                    if let Some(end_idx) = match_attached_trailer_suffix(
+                        &lines,
+                        idx,
+                        commit,
+                        trailer_search_end,
+                        &hard_protected,
+                    ) {
+                        flush_chunk(
+                            &mut segments,
+                            &mut chunk_start_idx,
+                            &mut chunk_last_non_blank,
+                        );
+                        segments.push(attached_verbatim(idx, end_idx));
+                        idx = end_idx + 1;
+                        continue;
+                    }
+                }
+            }
+
             // Markdeep-only constructs
             if is_markdeep {
                 if let Some(end_idx) = match_markdeep_diagram(&lines, idx) {
@@ -447,6 +780,97 @@ pub fn preprocess(text: &str, is_root: bool, is_markdeep: bool) -> Vec<PreSegmen
             // Standalone `@path` agent import, or standalone XML / prompt tag line (prevents
             // CommonMark HTML Block Rule 7 from swallowing the prose that follows).
             if is_standalone_at_import(trimmed) || is_standalone_prompt_xml_tag(trimmed) {
+                let is_col0_standalone = |l: &LineSpan<'_>| {
+                    !l.is_blank
+                        && !l.raw.starts_with([' ', '\t'])
+                        && (is_standalone_prompt_xml_tag(l.raw.trim())
+                            || is_standalone_at_import(l.raw.trim()))
+                };
+                if let Some((b_range, kind)) = find_top_block(&top_blocks, line.start) {
+                    let b_start = lines.partition_point(|l| l.end_excl <= b_range.start);
+                    let b_end = (b_start..lines.len())
+                        .take_while(|&i| lines[i].start < b_range.end)
+                        .filter(|&i| !lines[i].is_blank && !is_col0_standalone(&lines[i]))
+                        .last();
+                    if kind == TopBlockKind::ContextSensitive {
+                        // A column-0 prompt tag in the middle of a list, blockquote, footnote, or
+                        // setext heading would hide the surrounding container/heading context from
+                        // the lines that follow it (such as `  ---` or `  - nested`), so keep the
+                        // enclosing block intact up to its trailing standalone tags.
+                        if let Some(mut end_i) = b_end.filter(|&end_i| b_start < idx && end_i > idx)
+                        {
+                            if let Some(comment_prefix) =
+                                commit.map(|c| c.comment_prefix).filter(|_| is_root)
+                            {
+                                if let Some(c_idx) = (b_start..=end_i).rfind(|&i| {
+                                    !lines[i].is_blank
+                                        && is_commit_comment_line(lines[i].raw, comment_prefix)
+                                }) {
+                                    end_i =
+                                        end_i.max(commit_block_end(&lines, c_idx, &hard_protected));
+                                }
+                            }
+                            let first_i = rewind_to_block(
+                                &mut segments,
+                                &mut chunk_start_idx,
+                                &mut chunk_last_non_blank,
+                                &lines,
+                                b_start,
+                                idx,
+                            );
+                            segments.push(attached_verbatim(first_i, end_i));
+                            idx = end_i + 1;
+                            continue;
+                        }
+                    } else if let Some(mut end_i) =
+                        b_end.filter(|&end_i| b_start < idx && end_i > idx)
+                    {
+                        let next_idx = idx + 1;
+                        if next_idx < lines.len()
+                            && !lines[next_idx].is_blank
+                            && !is_col0_standalone(&lines[next_idx])
+                        {
+                            let (_, next_lb) = leading_ws_columns(lines[next_idx].raw, TAB_STOP);
+                            if !starts_top_level_paragraph(
+                                &text[lines[next_idx].start..],
+                                0,
+                                next_lb,
+                            ) {
+                                flush_chunk(
+                                    &mut segments,
+                                    &mut chunk_start_idx,
+                                    &mut chunk_last_non_blank,
+                                );
+                                let blank_before = idx > 0 && lines[idx - 1].is_blank;
+                                segments.push(PreSegment::StandaloneLine {
+                                    text: trimmed.to_string(),
+                                    blank_before,
+                                    blank_after: false,
+                                    range: line.start..line.end_excl,
+                                    start_line: line.line_no,
+                                    end_line: line.line_no,
+                                });
+                                if let Some(comment_prefix) =
+                                    commit.map(|c| c.comment_prefix).filter(|_| is_root)
+                                {
+                                    if let Some(c_idx) = (next_idx..=end_i).rfind(|&i| {
+                                        !lines[i].is_blank
+                                            && is_commit_comment_line(lines[i].raw, comment_prefix)
+                                    }) {
+                                        end_i = end_i.max(commit_block_end(
+                                            &lines,
+                                            c_idx,
+                                            &hard_protected,
+                                        ));
+                                    }
+                                }
+                                segments.push(attached_verbatim(next_idx, end_i));
+                                idx = end_i + 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
                 flush_chunk(
                     &mut segments,
                     &mut chunk_start_idx,
@@ -517,6 +941,19 @@ fn split_line_spans(text: &str) -> Vec<LineSpan<'_>> {
     }
 
     out
+}
+
+/// The last line of root-level frontmatter in `lines` (never a single-line commit subject).
+fn root_frontmatter_end(lines: &[LineSpan<'_>], commit: Option<CommitSyntax<'_>>) -> Option<usize> {
+    if commit.is_some_and(|c| is_single_line_commit_subject_at(lines, 0, c.comment_prefix)) {
+        return None;
+    }
+    match_frontmatter(lines)
+}
+
+/// Whether root-level `text` starts with frontmatter that [`preprocess`] would keep aside.
+pub(crate) fn starts_with_root_frontmatter(text: &str, commit: Option<CommitSyntax<'_>>) -> bool {
+    root_frontmatter_end(&split_line_spans(text), commit).is_some()
 }
 
 fn match_frontmatter(lines: &[LineSpan<'_>]) -> Option<usize> {
@@ -794,34 +1231,149 @@ fn html_tags(mut html: &str) -> Vec<(String, bool)> {
     tags
 }
 
-/// Ranges where preprocessing must not recognize extensions, as `(hard, soft)`. Hard ranges are
-/// literals and opaque HTML. Soft ranges are containers and inline HTML, where a standalone
-/// prompt tag at column 0 is still recognized. Prompt-tag HTML blocks are deliberately left
-/// available: their contents are Markdown in agent files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TopBlockKind {
+    /// `List`, `BlockQuote`, `FootnoteDefinition`, or `Heading`: splitting inside it hides
+    /// container indentation or heading underline context from later lines.
+    ContextSensitive,
+    /// Top-level `Paragraph`: safe to split at a standalone line unless the remainder would parse
+    /// as a different block construct in isolation.
+    Paragraph,
+}
+
+fn find_top_block(
+    blocks: &[(Range<usize>, TopBlockKind)],
+    offset: usize,
+) -> Option<(Range<usize>, TopBlockKind)> {
+    let idx = blocks.partition_point(|(r, _)| r.end <= offset);
+    blocks
+        .get(idx)
+        .filter(|(r, _)| r.start <= offset)
+        .map(|(r, kind)| (r.clone(), *kind))
+}
+
+fn rewind_to_block(
+    segments: &mut Vec<PreSegment>,
+    chunk_start_idx: &mut Option<usize>,
+    chunk_last_non_blank: &mut Option<usize>,
+    lines: &[LineSpan<'_>],
+    mut block_first: usize,
+    idx: usize,
+) -> usize {
+    match *chunk_start_idx {
+        Some(chunk_start) if chunk_start < block_first => {
+            // The chunk holds earlier blocks too: emit just those.
+            *chunk_last_non_blank = (chunk_start..block_first)
+                .rev()
+                .find(|&i| !lines[i].is_blank);
+            if let (Some(start_i), Some(end_i)) = (*chunk_start_idx, *chunk_last_non_blank) {
+                if start_i <= end_i {
+                    segments.push(PreSegment::MarkdownChunk {
+                        range: lines[start_i].start..lines[end_i].end_excl,
+                        start_line: lines[start_i].line_no,
+                    });
+                }
+            }
+            *chunk_start_idx = None;
+            *chunk_last_non_blank = None;
+        }
+        _ => {
+            // Pieces of this block may already be emitted (a standalone prompt
+            // tag line splits a paragraph): they join the kept block.
+            *chunk_start_idx = None;
+            *chunk_last_non_blank = None;
+            let block_offset = lines[block_first].start;
+            while let Some(range) = segments.last().map(PreSegment::range) {
+                if range.start >= block_offset {
+                    segments.pop();
+                    continue;
+                }
+                if range.end > block_offset {
+                    if let Some(PreSegment::MarkdownChunk { range, .. }) = segments.last_mut() {
+                        // A chunk holding earlier blocks and the start of this
+                        // one: cut it at the block boundary.
+                        let chunk_start = range.start;
+                        match (0..block_first)
+                            .rev()
+                            .find(|&i| !lines[i].is_blank && lines[i].start >= chunk_start)
+                        {
+                            Some(last) => range.end = lines[last].end_excl,
+                            None => {
+                                segments.pop();
+                            }
+                        }
+                    } else {
+                        // Other segments are kept as written or are single
+                        // constructs; the kept block starts after them.
+                        block_first = (block_first..=idx)
+                            .find(|&i| lines[i].start >= range.end)
+                            .unwrap_or(idx);
+                    }
+                }
+                break;
+            }
+        }
+    }
+    block_first
+}
+
+/// Ranges where preprocessing must not recognize extensions, as `(hard, soft)`, shifted by
+/// `offset`. Hard ranges are literals and opaque HTML. Soft ranges are containers and inline
+/// HTML, where a standalone prompt tag at column 0 is still recognized.
 fn protected_ranges(text: &str) -> (Intervals, Intervals) {
+    let (hard, soft, _) = protected_ranges_from(text, 0);
+    (hard, soft)
+}
+
+fn protected_ranges_from(
+    text: &str,
+    offset: usize,
+) -> (Intervals, Intervals, Vec<(Range<usize>, TopBlockKind)>) {
+    let shift = |r: Range<usize>| (r.start + offset)..(r.end + offset);
     let mut hard = Vec::new();
     let mut soft = Vec::new();
+    let mut top_blocks = Vec::new();
+    let mut depth = 0usize;
     for (event, range) in Parser::new_ext(text, parser_options()).into_offset_iter() {
+        if let Event::Start(tag) = &event {
+            if depth == 0 {
+                match tag {
+                    Tag::List(_)
+                    | Tag::BlockQuote(_)
+                    | Tag::FootnoteDefinition(_)
+                    | Tag::Heading { .. } => {
+                        top_blocks.push((shift(range.clone()), TopBlockKind::ContextSensitive));
+                    }
+                    Tag::Paragraph => {
+                        top_blocks.push((shift(range.clone()), TopBlockKind::Paragraph));
+                    }
+                    _ => {}
+                }
+            }
+            depth += 1;
+        } else if matches!(event, Event::End(_)) {
+            depth = depth.saturating_sub(1);
+        }
         match event {
             Event::Start(Tag::CodeBlock(_))
             | Event::Code(_)
             | Event::InlineMath(_)
-            | Event::DisplayMath(_) => hard.push(range),
+            | Event::DisplayMath(_) => hard.push(shift(range)),
             Event::Start(Tag::HtmlBlock) => {
                 let first = text[range.clone()].lines().next().unwrap_or("").trim();
                 if !is_standalone_prompt_xml_tag(first)
                     && !is_formatter_off_comment(first)
                     && !is_ignore_next_comment(first)
                 {
-                    hard.push(range);
+                    hard.push(shift(range));
                 }
             }
             Event::Start(Tag::List(_) | Tag::BlockQuote(_) | Tag::FootnoteDefinition(_))
-            | Event::InlineHtml(_) => soft.push(range),
+            | Event::InlineHtml(_) => soft.push(shift(range)),
             _ => {}
         }
     }
-    (Intervals::new(hard), Intervals::new(soft))
+    (Intervals::new(hard), Intervals::new(soft), top_blocks)
 }
 
 /// A union of ranges, merged and sorted for `O(log n)` queries.
@@ -1291,4 +1843,816 @@ fn is_valid_xml_tag_name(name: &str) -> bool {
 fn is_excluded_html_tag(tag_name: &str) -> bool {
     let lower = tag_name.to_ascii_lowercase();
     EXCLUDED_HTML_TAGS.contains(&lower.as_str())
+}
+
+/// The Git settings that decide how a commit message's lines are read: the comment prefix
+/// (`core.commentChar` / `core.commentString`, resolved from `auto`) and the trailer separator
+/// characters (`trailer.separators`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CommitSyntax<'a> {
+    pub comment_prefix: &'a str,
+    pub trailer_separators: &'a str,
+    /// Names and `key` values of Git's configured `trailer.<name>.*` trailers.
+    pub trailer_keys: &'a [String],
+}
+
+/// Whether `raw` is the `---` line where Git's trailer parsing (`trailer.c:find_patch_start`)
+/// takes the patch to begin: `---` followed by whitespace or the end of the line.
+pub(crate) fn is_git_patch_divider(raw: &str) -> bool {
+    raw.strip_prefix("---")
+        .is_some_and(|rest| rest.chars().next().is_none_or(char::is_whitespace))
+}
+
+/// Whether `git am` (`mailinfo.c:patchbreak`) reads `raw` as the start of a patch, which ends the
+/// commit message: `diff -` or `Index: ` at column 0.
+pub(crate) fn is_git_patch_break(raw: &str) -> bool {
+    raw.starts_with("diff -") || raw.starts_with("Index: ")
+}
+
+/// Byte offset where Git stops looking for trailers in `text`: the start of the first
+/// [`is_git_patch_divider`] line, or the end of `text`.
+pub(crate) fn git_trailer_search_end(text: &str) -> usize {
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        if is_git_patch_divider(line.trim_end_matches(['\r', '\n'])) {
+            return offset;
+        }
+        offset += line.len();
+    }
+    text.len()
+}
+
+/// Candidate comment characters tried by Git when `core.commentChar = auto`
+/// (`builtin/commit.c:adjust_comment_line_char`).
+const AUTO_COMMENT_CANDIDATES: &[&str] = &["#", ";", "@", "!", "$", "%", "^", "&", "|", ":"];
+
+const GIT_SCISSORS_SUFFIX: &str = " ------------------------ >8 ------------------------";
+
+/// Resolves `configured` (`FormattingOptions::comment_char`) into a concrete line prefix for
+/// `text`. When `configured` is `"auto"`, detects the character Git wrote into the commit buffer's
+/// status/scissors section, or picks the first unused candidate from `#;@!$%^&|:`.
+pub(crate) fn resolve_comment_prefix<'a>(text: &str, configured: &'a str) -> &'a str {
+    if !configured.eq_ignore_ascii_case("auto") {
+        return if configured.is_empty() {
+            "#"
+        } else {
+            configured
+        };
+    }
+
+    let raw_lines: Vec<&str> = text.split('\n').map(|l| l.trim_end_matches('\r')).collect();
+    for &c in AUTO_COMMENT_CANDIDATES {
+        if raw_lines
+            .iter()
+            .any(|l| l.strip_prefix(c) == Some(GIT_SCISSORS_SUFFIX))
+        {
+            return c;
+        }
+    }
+    for &c in AUTO_COMMENT_CANDIDATES {
+        let hint = format!("with '{c}' will be ignored");
+        if raw_lines
+            .iter()
+            .any(|l| l.starts_with(c) && l.contains(&hint))
+        {
+            return c;
+        }
+    }
+    // Check for a trailing status block of 2+ consecutive lines starting with the same candidate.
+    let trailing_non_blank: Vec<&str> = raw_lines
+        .iter()
+        .copied()
+        .rev()
+        .skip_while(|l| l.trim().is_empty())
+        .take_while(|l| !l.trim().is_empty())
+        .collect();
+    if trailing_non_blank.len() >= 2 {
+        for &c in AUTO_COMMENT_CANDIDATES {
+            if trailing_non_blank.iter().all(|l| l.starts_with(c)) {
+                return c;
+            }
+        }
+    }
+    for &c in AUTO_COMMENT_CANDIDATES {
+        if !raw_lines.iter().any(|l| l.starts_with(c)) {
+            return c;
+        }
+    }
+    "#"
+}
+
+/// Whether `raw` is a Git or Jujutsu commit comment line at column 0.
+pub(crate) fn is_commit_comment_line(raw: &str, comment_prefix: &str) -> bool {
+    let bare = comment_prefix.trim_end_matches(' ');
+    raw.starts_with(comment_prefix) || (!bare.is_empty() && raw == bare) || raw.starts_with("JJ:")
+}
+
+/// Whether `raw` is an exact Git (`<comment_prefix> ------------------------ >8 ------------------------`)
+/// or Jujutsu (`JJ: ignore-rest`) scissors line.
+///
+/// Git writes the prefix exactly as configured followed by its own space, so a prefix that ends
+/// in a space (`core.commentString = "// "`) is followed by two spaces.
+pub(crate) fn is_commit_scissors_line(raw: &str, comment_prefix: &str) -> bool {
+    raw == "JJ: ignore-rest"
+        || (!comment_prefix.trim().is_empty()
+            && raw.strip_prefix(comment_prefix) == Some(GIT_SCISSORS_SUFFIX))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommitTailSplit {
+    /// Byte end of the active commit message head (excluding blank lines immediately before tail).
+    pub head_end: usize,
+    /// Verbatim tail range in `text` (omitting at most one final document `\n`), if present.
+    pub tail_range: Option<Range<usize>>,
+    pub tail_start_line: usize,
+    pub tail_end_line: usize,
+    pub had_blank_before_tail: bool,
+}
+
+/// Splits off any trailing comment block and/or scissors diff section (`git commit -v`,
+/// `JJ: ignore-rest`) at the end of LF-normalized `text`.
+pub(crate) fn split_commit_tail(text: &str, comment_prefix: &str) -> CommitTailSplit {
+    let lines = split_line_spans(text);
+    if lines.is_empty() {
+        return CommitTailSplit {
+            head_end: 0,
+            tail_range: None,
+            tail_start_line: 1,
+            tail_end_line: 1,
+            had_blank_before_tail: false,
+        };
+    }
+
+    let scissors_idx = lines
+        .iter()
+        .position(|l| is_commit_scissors_line(l.raw, comment_prefix));
+    let mut tail_idx = scissors_idx.unwrap_or(lines.len());
+
+    // A `#` line that closes a multi-line code span (or sits in other literal text) is part of
+    // that literal for CommonMark, so it stays with the message it belongs to.
+    let message_end = lines.get(tail_idx).map_or(text.len(), |l| l.start);
+    let mut literals: Option<Intervals> = None;
+    while let Some(prev_non_blank) = (0..tail_idx).rev().find(|&i| !lines[i].is_blank) {
+        let line = lines[prev_non_blank];
+        if !is_commit_comment_line(line.raw, comment_prefix) {
+            break;
+        }
+        let literals = literals.get_or_insert_with(|| protected_ranges(&text[..message_end]).0);
+        if literals.overlaps(line.start, line.start) {
+            break;
+        }
+        tail_idx = prev_non_blank;
+    }
+
+    if tail_idx >= lines.len() {
+        return CommitTailSplit {
+            head_end: text.len(),
+            tail_range: None,
+            tail_start_line: lines.len(),
+            tail_end_line: lines.len(),
+            had_blank_before_tail: false,
+        };
+    }
+
+    let last_head_idx = (0..tail_idx).rev().find(|&i| !lines[i].is_blank);
+    let had_blank_before_tail = last_head_idx.is_some_and(|h| h + 1 < tail_idx);
+    let head_end = last_head_idx.map_or(0, |h| (lines[h].end_excl + 1).min(lines[tail_idx].start));
+    let tail_start = lines[tail_idx].start;
+    let tail_end = text
+        .strip_suffix('\n')
+        .map_or(text.len(), str::len)
+        .max(tail_start);
+
+    CommitTailSplit {
+        head_end,
+        tail_range: Some(tail_start..tail_end),
+        tail_start_line: lines[tail_idx].line_no,
+        tail_end_line: lines[lines.len() - 1].line_no,
+        had_blank_before_tail,
+    }
+}
+
+/// The last line of the top-level block that continues past line `from`: through following
+/// non-blank lines, across blank lines followed by indented ones (list item and quote
+/// continuations), and through fenced code and other literals that contain blank lines.
+fn commit_block_end(lines: &[LineSpan<'_>], from: usize, hard_protected: &Intervals) -> usize {
+    let mut last = from;
+    let mut fence: Option<FenceState> = None;
+    let mut idx = from + 1;
+    while idx < lines.len() {
+        let line = lines[idx];
+        if let Some(open) = fence {
+            if is_fence_close(line.raw, open.ch, open.count) {
+                fence = None;
+            }
+            last = idx;
+            idx += 1;
+            continue;
+        }
+        if line.is_blank {
+            // Blank lines inside an HTML block or other literal (even trailing ones, as in an
+            // unclosed `<pre>`) belong to it.
+            if hard_protected.overlaps(line.start, line.start) {
+                last = idx;
+                idx += 1;
+                continue;
+            }
+            match (idx..lines.len()).find(|&i| !lines[i].is_blank) {
+                Some(next) if lines[next].raw.starts_with([' ', '\t']) => {
+                    idx = next;
+                    continue;
+                }
+                _ => break,
+            }
+        }
+        fence = parse_fence_open(line.raw.trim_start());
+        last = idx;
+        idx += 1;
+    }
+    last
+}
+
+/// If the first non-blank line at or after `start` is indented, returns the index of the last
+/// non-blank line of the run of indented and blank lines starting there (including any fenced
+/// code block opened inside it, wherever its closing fence is).
+fn indented_run_end(lines: &[LineSpan<'_>], start: usize) -> Option<usize> {
+    let first = (start..lines.len()).find(|&i| !lines[i].is_blank)?;
+    if !lines[first].raw.starts_with([' ', '\t']) {
+        return None;
+    }
+    let mut last = first;
+    let mut idx = first;
+    while idx < lines.len() {
+        let line = lines[idx];
+        if line.is_blank {
+            idx += 1;
+            continue;
+        }
+        if !line.raw.starts_with([' ', '\t']) {
+            break;
+        }
+        if let Some(open) = parse_fence_open(line.raw.trim_start()) {
+            idx += 1;
+            while idx < lines.len() && !is_fence_close(lines[idx].raw, open.ch, open.count) {
+                idx += 1;
+            }
+            idx = idx.min(lines.len() - 1);
+        }
+        last = idx;
+        idx += 1;
+    }
+    Some(last)
+}
+
+fn is_single_line_commit_subject_at(
+    lines: &[LineSpan<'_>],
+    idx: usize,
+    comment_prefix: &str,
+) -> bool {
+    let first = lines[idx];
+    // A complete armored block (a lone PGP signature) is kept whole by the armor rule instead.
+    if first.is_blank
+        || is_commit_comment_line(first.raw, comment_prefix)
+        || match_armored_block(lines, idx).is_some()
+    {
+        return false;
+    }
+    let (_, lead_bytes) = leading_ws_columns(first.raw, TAB_STOP);
+    if lead_bytes <= 3
+        && !first.raw.starts_with('\t')
+        && parse_fence_open(&first.raw[lead_bytes..]).is_some()
+    {
+        return false;
+    }
+    lines
+        .get(idx + 1)
+        .is_none_or(|next| next.is_blank || is_commit_comment_line(next.raw, comment_prefix))
+}
+
+fn ends_with_markdown_hard_break(raw: &str) -> bool {
+    let trimmed_end = raw.trim_end_matches([' ', '\t']);
+    if trimmed_end.is_empty() {
+        return false;
+    }
+    let backslashes = trimmed_end
+        .bytes()
+        .rev()
+        .take_while(|&b| b == b'\\')
+        .count();
+    (trimmed_end.ends_with('\\') && backslashes % 2 == 1) || raw.ends_with("  ")
+}
+
+fn match_armored_block(lines: &[LineSpan<'_>], start: usize) -> Option<usize> {
+    let open = lines[start].raw.trim();
+    let suffix = open.strip_prefix("-----BEGIN ")?;
+    let label = suffix.strip_suffix("-----")?;
+    if label.is_empty() || label.contains('-') {
+        return None;
+    }
+    let expected_close = format!("-----END {label}-----");
+    for (idx, line) in lines.iter().enumerate().skip(start + 1) {
+        if line.raw.trim() == expected_close {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+/// Whether the line at `rel_line_start..=rel_content_start` starts a new top-level paragraph or
+/// heading inside `chunk_to_end` (for instance immediately after a closing code fence, rule, or
+/// ATX heading without a blank line), rather than continuing a preceding paragraph or table.
+fn starts_top_level_paragraph(
+    chunk_to_end: &str,
+    rel_line_start: usize,
+    rel_content_start: usize,
+) -> bool {
+    let mut depth = 0usize;
+    for (event, range) in Parser::new_ext(chunk_to_end, parser_options()).into_offset_iter() {
+        match event {
+            Event::Start(Tag::Paragraph | Tag::Heading { .. }) if depth == 0 => {
+                if (rel_line_start..=rel_content_start).contains(&range.start) {
+                    return true;
+                }
+                if range.start > rel_content_start {
+                    return false;
+                }
+                depth += 1;
+            }
+            Event::Start(_) => {
+                if depth == 0 && range.start > rel_content_start {
+                    return false;
+                }
+                depth += 1;
+            }
+            Event::End(_) => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Extends an armored block ending at `close_idx` across any immediately attached continuation
+/// lines of the same CommonMark block (so lines like `    continuation\nfollowing text` attached
+/// directly to `-----END ...-----` are not detached and reparsed as indented code).
+fn extend_armored_block_end(
+    text: &str,
+    lines: &[LineSpan<'_>],
+    start_idx: usize,
+    close_idx: usize,
+    limit: usize,
+    comment_prefix: &str,
+    hard_protected: &Intervals,
+) -> usize {
+    if close_idx + 1 >= lines.len()
+        || lines[close_idx + 1].is_blank
+        || lines[close_idx + 1].start >= limit
+    {
+        return close_idx;
+    }
+    let base = lines[start_idx].start;
+    let rel_close = lines[close_idx].start - base;
+    let rel_close_end = lines[close_idx]
+        .end_excl
+        .max(lines[close_idx].start + 1)
+        .saturating_sub(base);
+    let slice = &text[base..limit];
+    let mut depth = 0usize;
+    let mut top_start = 0usize;
+    let mut abs_end = lines[close_idx].end_excl;
+    for (event, range) in Parser::new_ext(slice, parser_options()).into_offset_iter() {
+        match event {
+            Event::Start(_) => {
+                if depth == 0 {
+                    top_start = range.start;
+                }
+                depth += 1;
+            }
+            Event::End(_) => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 && top_start < rel_close_end && range.end > rel_close {
+                    abs_end = base + range.end;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut end_idx = (close_idx..lines.len())
+        .take_while(|&i| lines[i].start < abs_end)
+        .filter(|&i| !lines[i].is_blank)
+        .last()
+        .unwrap_or(close_idx);
+    if let Some(comment_idx) = ((close_idx + 1)..=end_idx)
+        .find(|&i| !lines[i].is_blank && is_commit_comment_line(lines[i].raw, comment_prefix))
+    {
+        end_idx = end_idx.max(commit_block_end(lines, comment_idx, hard_protected));
+    }
+    end_idx
+}
+
+/// Whether `word` is a valid Git trailer token name (`[A-Za-z0-9-]+`).
+pub(crate) fn is_trailer_token_name(word: &str) -> bool {
+    !word.is_empty() && word.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+/// Whether `word` at the start of a line would make it a trailer line: `Token:` (a word ending
+/// right after the `:`, so URLs are not included) or, for another configured separator such as
+/// `=`, `Token=` followed by anything.
+pub(crate) fn is_trailer_token_word(word: &str, separators: &str) -> bool {
+    let Some(pos) = word.find(|c| separators.contains(c)) else {
+        return false;
+    };
+    is_trailer_token_name(&word[..pos]) && (!word[pos..].starts_with(':') || pos + 1 == word.len())
+}
+
+/// Matches Git's `trailer.c:find_separator` for the `trailer.separators` characters, returning
+/// the token before optional horizontal whitespace and the separator's byte offset.
+pub(crate) fn find_git_trailer_separator<'a>(
+    line: &'a str,
+    separators: &str,
+) -> Option<(&'a str, usize)> {
+    if line.is_empty() || line.starts_with([' ', '\t']) {
+        return None;
+    }
+    let sep = line.find(|c| separators.contains(c))?;
+    let token = line[..sep].trim_end_matches([' ', '\t']);
+    is_trailer_token_name(token).then_some((token, sep))
+}
+
+/// The text after the separator character starting at byte `sep`.
+fn after_separator(line: &str, sep: usize) -> &str {
+    let mut rest = line[sep..].chars();
+    rest.next();
+    rest.as_str()
+}
+
+/// The value after the separator at `sep`, unless the separator is a `:` glued to the value
+/// (`https://...`), which reads as prose rather than a trailer.
+fn trailer_value(line: &str, sep: usize) -> Option<&str> {
+    let after = after_separator(line, sep);
+    let glued_colon = line[sep..].starts_with(':') && !after.is_empty();
+    (!glued_colon || after.starts_with([' ', '\t'])).then_some(after)
+}
+
+fn is_git_generated_prefix(line: &str) -> bool {
+    line.starts_with("Signed-off-by: ") || line.starts_with("(cherry picked from commit ")
+}
+
+/// Whether `line` is an unambiguous Git/Gerrit trailer line (`Change-Id:`, `Signed-off-by:`,
+/// `Bug:`, `Test:`, `Relnote:`, `(cherry picked from commit ...)`, etc.) rather than a URL or
+/// generic prose label like `Note:`.
+pub(crate) fn is_well_known_trailer_line(line: &str, separators: &str) -> bool {
+    if line.starts_with("(cherry picked from commit ") {
+        return true;
+    }
+    let Some((token, sep)) = find_git_trailer_separator(line, separators) else {
+        return false;
+    };
+    if trailer_value(line, sep).is_none() {
+        return false;
+    }
+    if token.contains('-') && token.as_bytes()[0].is_ascii_alphabetic() {
+        return true;
+    }
+    matches!(
+        token.to_ascii_lowercase().as_str(),
+        "bug"
+            | "bugs"
+            | "fix"
+            | "fixes"
+            | "fixed"
+            | "close"
+            | "closes"
+            | "closed"
+            | "resolve"
+            | "resolves"
+            | "resolved"
+            | "ref"
+            | "refs"
+            | "reference"
+            | "references"
+            | "issue"
+            | "issues"
+            | "test"
+            | "tests"
+            | "testing"
+            | "relnote"
+            | "flag"
+            | "cc"
+            | "bcc"
+            | "link"
+            | "see"
+            | "acked"
+    )
+}
+
+/// The lines Git's `trailer.c` reads as a commit message's trailer block candidate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GitTrailerCandidate {
+    /// Indices of the candidate lines: from just after the blank line where Git's backward scan
+    /// stopped to the end of the log message (excluding the trailing comment and empty lines that
+    /// Git ignores). Comment lines inside the range are skipped by Git but still part of it.
+    pub lines: Range<usize>,
+    /// Whether Git accepts the candidate as a trailer block (`git interpret-trailers --parse`
+    /// prints it).
+    pub is_block: bool,
+}
+
+/// C `isspace` on a byte (Git's `is_blank_line` and continuation checks).
+fn is_c_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
+}
+
+/// Mirrors Git's `trailer.c` (`find_end_of_log_message`, `ignored_log_message_bytes`, and
+/// `find_trailer_block_start`) on a whole LF-split commit message: stops at the first `---`
+/// patch divider and any scissors line, ignores the run of comment and empty lines that ends
+/// the log message, skips the title paragraph, and scans backward to the last blank line,
+/// skipping comment lines. Returns `None` when Git finds no blank-line-separated candidate.
+pub(crate) fn find_git_trailer_candidate(
+    raw_lines: &[&str],
+    commit: CommitSyntax<'_>,
+) -> Option<GitTrailerCandidate> {
+    let prefix = commit.comment_prefix;
+    let is_comment = |line: &str| is_git_comment_line(line, prefix);
+    let is_blank = |line: &str| line.bytes().all(is_c_space);
+    let end = git_log_message_end(raw_lines, commit).end;
+
+    // The first paragraph is the title and cannot hold trailers.
+    let title_end = (0..end).find(|&i| !is_comment(raw_lines[i]) && is_blank(raw_lines[i]))?;
+
+    let mut only_spaces = true;
+    let mut trailer_lines = 0usize;
+    let mut non_trailer_lines = 0usize;
+    let mut possible_continuation_lines = 0usize;
+    let mut recognized_prefix = false;
+    for i in (title_end..end).rev() {
+        let line = raw_lines[i];
+        if is_comment(line) {
+            non_trailer_lines += possible_continuation_lines;
+            possible_continuation_lines = 0;
+            continue;
+        }
+        if is_blank(line) {
+            if only_spaces {
+                continue;
+            }
+            non_trailer_lines += possible_continuation_lines;
+            let is_block = trailer_lines > 0
+                && (non_trailer_lines == 0
+                    || (recognized_prefix && trailer_lines * 3 >= non_trailer_lines));
+            return Some(GitTrailerCandidate {
+                lines: i + 1..end,
+                is_block,
+            });
+        }
+        only_spaces = false;
+        if is_git_generated_prefix(line) {
+            trailer_lines += 1;
+            possible_continuation_lines = 0;
+            recognized_prefix = true;
+        } else if let Some((_, sep)) = find_git_trailer_separator(line, commit.trailer_separators) {
+            trailer_lines += 1;
+            possible_continuation_lines = 0;
+            // `trailer.c:token_matches_item`: the text before the separator is a prefix of a
+            // configured trailer's name or key.
+            let token = &line[..sep];
+            if commit.trailer_keys.iter().any(|key| {
+                key.get(..token.len())
+                    .is_some_and(|start| start.eq_ignore_ascii_case(token))
+            }) {
+                recognized_prefix = true;
+            }
+        } else if line.bytes().next().is_some_and(is_c_space) {
+            possible_continuation_lines += 1;
+        } else {
+            non_trailer_lines += 1 + possible_continuation_lines;
+            possible_continuation_lines = 0;
+        }
+    }
+    None
+}
+
+/// Where Git's `trailer.c` takes a commit message's log message to end.
+pub(crate) struct GitLogMessageEnd {
+    /// The line after the log message: the start of the final run of comment and empty lines
+    /// (and old-style `Conflicts:` blocks) above any scissors line and `---` patch divider.
+    pub end: usize,
+    /// The line where Git stops reading (the scissors line, `---` divider, or the end).
+    pub cutoff: usize,
+    /// The ignored final run holds a `Conflicts:` block, which Git only skips when it is
+    /// exactly `Conflicts:` followed by tab-indented paths.
+    pub has_conflicts: bool,
+}
+
+/// Whether Git itself reads `raw` as a comment line (`starts_with(comment_line_str)`). Unlike
+/// [`is_commit_comment_line`], this excludes Jujutsu's `JJ:` lines, which Git reads as text (or
+/// trailers), so the trailer analysis below matches `git interpret-trailers`.
+pub(crate) fn is_git_comment_line(raw: &str, comment_prefix: &str) -> bool {
+    !comment_prefix.is_empty() && raw.starts_with(comment_prefix)
+}
+
+/// Mirrors Git's `find_end_of_log_message` and `ignored_log_message_bytes` on LF-split lines.
+pub(crate) fn git_log_message_end(
+    raw_lines: &[&str],
+    commit: CommitSyntax<'_>,
+) -> GitLogMessageEnd {
+    let prefix = commit.comment_prefix;
+    let divider = raw_lines
+        .iter()
+        .position(|l| is_git_patch_divider(l))
+        .unwrap_or(raw_lines.len());
+    // `wt_status_locate_end`: everything from a scissors line on is ignored.
+    let cutoff = raw_lines[..divider]
+        .iter()
+        .position(|l| {
+            !prefix.trim().is_empty() && l.strip_prefix(prefix) == Some(GIT_SCISSORS_SUFFIX)
+        })
+        .unwrap_or(divider);
+    let mut run_start: Option<usize> = None;
+    let mut in_conflicts = false;
+    let mut has_conflicts = false;
+    for (i, &line) in raw_lines[..cutoff].iter().enumerate() {
+        if line.is_empty() || is_git_comment_line(line, prefix) {
+            run_start.get_or_insert(i);
+        } else if line == "Conflicts:" {
+            in_conflicts = true;
+            has_conflicts = true;
+            run_start.get_or_insert(i);
+        } else if in_conflicts && line.starts_with('\t') {
+            // A path in the conflicts block.
+        } else {
+            run_start = None;
+            in_conflicts = false;
+            has_conflicts = false;
+        }
+    }
+    GitLogMessageEnd {
+        end: run_start.unwrap_or(cutoff),
+        cutoff,
+        has_conflicts,
+    }
+}
+
+/// [`find_git_trailer_candidate`] on LF-normalized `text`.
+pub(crate) fn find_git_trailer_candidate_in(
+    text: &str,
+    commit: CommitSyntax<'_>,
+) -> Option<GitTrailerCandidate> {
+    let lines: Vec<&str> = text
+        .strip_suffix('\n')
+        .unwrap_or(text)
+        .split('\n')
+        .collect();
+    find_git_trailer_candidate(&lines, commit)
+}
+
+/// Scans a contiguous non-blank paragraph starting at `start` to check whether it should be
+/// preserved verbatim as a trailer block by the multi-trailer / Gerrit / multi-line quoted
+/// `Relnote:` rules for squash and Gerrit messages. (The block Git itself reads as trailers is
+/// found up front by [`find_git_trailer_candidate`].)
+fn match_commit_trailer_block(
+    lines: &[LineSpan<'_>],
+    start: usize,
+    commit: CommitSyntax<'_>,
+    trailer_search_end: usize,
+) -> Option<usize> {
+    let mut end = start;
+    while end + 1 < lines.len() && end + 1 != trailer_search_end && !lines[end + 1].is_blank {
+        let next = lines[end + 1];
+        let (cols, lb) = leading_ws_columns(next.raw, TAB_STOP);
+        if cols <= 3 && !next.raw.starts_with('\t') && parse_fence_open(&next.raw[lb..]).is_some() {
+            break;
+        }
+        end += 1;
+    }
+
+    let raw_slice: Vec<&str> = lines[start..=end].iter().map(|l| l.raw).collect();
+    if is_structured_trailer_entries(&raw_slice, commit) {
+        return Some(end);
+    }
+
+    None
+}
+
+/// Recognizes trailer blocks with 2+ spaced `Token: value` entries or 1+ unambiguous Git/Gerrit
+/// entries (such as `Change-Id:`, `Bug:`, `Test:`, or multi-line quoted `Relnote: "..."`), even
+/// when they appear mid-message in `SQUASH_MSG` or use unindented quoted `Relnote:` continuations.
+pub(crate) fn is_structured_trailer_entries(raw_lines: &[&str], commit: CommitSyntax<'_>) -> bool {
+    let mut entries = 0usize;
+    let mut saw_well_known = false;
+    let mut in_quote = false;
+
+    for &line in raw_lines {
+        if is_commit_comment_line(line, commit.comment_prefix) {
+            continue;
+        }
+        if in_quote {
+            if ends_unclosed_double_quote(line) {
+                in_quote = false;
+            }
+            continue;
+        }
+        if line.starts_with("(cherry picked from commit ") {
+            entries += 1;
+            saw_well_known = true;
+            continue;
+        }
+        if let Some((token, sep)) = find_git_trailer_separator(line, commit.trailer_separators) {
+            let Some(after) = trailer_value(line, sep) else {
+                return false;
+            };
+            entries += 1;
+            if is_well_known_trailer_line(line, commit.trailer_separators) {
+                saw_well_known = true;
+                if starts_unclosed_double_quote(after.trim())
+                    && token.eq_ignore_ascii_case("relnote")
+                {
+                    in_quote = true;
+                }
+            }
+            continue;
+        }
+        if entries > 0 && line.starts_with([' ', '\t']) {
+            continue;
+        }
+        return false;
+    }
+
+    !in_quote && (entries >= 2 || (entries == 1 && saw_well_known))
+}
+
+/// Checks if `lines[start..=end]` (at the bottom of a prose paragraph) consists solely of
+/// unambiguous Git/Gerrit trailer entries so they stay on their own lines rather than merging
+/// into the prose line above.
+fn match_attached_trailer_suffix(
+    lines: &[LineSpan<'_>],
+    start: usize,
+    commit: CommitSyntax<'_>,
+    trailer_search_end: usize,
+    hard_protected: &Intervals,
+) -> Option<usize> {
+    let separators = commit.trailer_separators;
+    // A line continuing a multi-line code span or link is not a trailer of its own.
+    if hard_protected.overlaps(lines[start].start, lines[start].start)
+        || !is_well_known_trailer_line(lines[start].raw, separators)
+    {
+        return None;
+    }
+    let mut end = start;
+    while end + 1 < lines.len()
+        && end + 1 != trailer_search_end
+        && !lines[end + 1].is_blank
+        && !is_commit_comment_line(lines[end + 1].raw, commit.comment_prefix)
+    {
+        let next = lines[end + 1];
+        if hard_protected.overlaps(next.start, next.start) {
+            return None;
+        }
+        end += 1;
+    }
+    let raw_slice: Vec<&str> = lines[start..=end].iter().map(|l| l.raw).collect();
+    let mut entries = 0usize;
+    let mut in_quote = false;
+    for &line in &raw_slice {
+        if in_quote {
+            if ends_unclosed_double_quote(line) {
+                in_quote = false;
+            }
+            continue;
+        }
+        if is_well_known_trailer_line(line, separators) {
+            entries += 1;
+            if let Some((token, sep)) = find_git_trailer_separator(line, separators) {
+                let after = after_separator(line, sep).trim();
+                if token.eq_ignore_ascii_case("relnote") && starts_unclosed_double_quote(after) {
+                    in_quote = true;
+                }
+            }
+        } else if entries > 0 && line.starts_with([' ', '\t']) {
+            continue;
+        } else {
+            return None;
+        }
+    }
+    (!in_quote && entries > 0).then_some(end)
+}
+
+fn starts_unclosed_double_quote(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix('"') else {
+        return false;
+    };
+    !ends_unclosed_double_quote(rest)
+}
+
+fn ends_unclosed_double_quote(s: &str) -> bool {
+    let trimmed = s.trim_end();
+    if !trimmed.ends_with('"') {
+        return false;
+    }
+    let backslashes = trimmed[..trimmed.len() - 1]
+        .bytes()
+        .rev()
+        .take_while(|&b| b == b'\\')
+        .count();
+    backslashes % 2 == 0
 }

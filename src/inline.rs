@@ -14,7 +14,7 @@
 
 use crate::markdown::{merged, parser_options, strictly_inside};
 use crate::options::WrapMode;
-use crate::preprocess;
+use crate::preprocess::{self, CommitSyntax};
 use pulldown_cmark::{Event, Parser, Tag};
 use unicode_width::UnicodeWidthStr;
 
@@ -178,6 +178,26 @@ pub fn can_start_line(word: &str) -> bool {
     !(word.starts_with('@') && !word.starts_with("@["))
 }
 
+/// Like [`can_start_line`], also rejecting tokens that Git or Jujutsu commit-message handling
+/// treats as comments (`<comment_prefix>...`, `JJ:...`), armored blocks (`-----BEGIN`),
+/// `git am` patch breaks (`Index:`), or trailer keys (`Token:`, `(cherry`) when `commit` is set.
+pub(crate) fn can_start_line_in_mode(word: &str, commit: Option<CommitSyntax<'_>>) -> bool {
+    can_start_line(word) && !commit.is_some_and(|commit| is_commit_line_hazard(word, commit))
+}
+
+/// Whether `word` at column 0 would make Git or Jujutsu treat the line as a comment, armored
+/// block, `git am` patch break, or trailer.
+fn is_commit_line_hazard(word: &str, commit: CommitSyntax<'_>) -> bool {
+    let bare_prefix = commit.comment_prefix.trim_end_matches([' ', '\t']);
+    (!bare_prefix.is_empty() && word.starts_with(bare_prefix))
+        || word.starts_with("JJ:")
+        || word == "Index:"
+        || word.starts_with("-----BEGIN")
+        || word.starts_with("diff -")
+        || word.eq_ignore_ascii_case("(cherry")
+        || preprocess::is_trailer_token_word(word, commit.trailer_separators)
+}
+
 /// Whether `word` begins with a complete CommonMark autolink (`<scheme:...>` or
 /// `<local@domain>`), which can safely start a line, unlike an HTML tag or comment.
 pub(crate) fn starts_with_autolink(word: &str) -> bool {
@@ -221,12 +241,12 @@ fn ends_with_hard_break(word: &str) -> bool {
 
 /// Returns true if `prefix` (the accumulated token at the start of a line) would be parsed as a
 /// different block construct if a line break immediately followed it.
-fn cannot_stand_alone_on_line(prefix: &str) -> bool {
-    if !prefix.contains(' ') && !can_start_line(prefix) {
+fn cannot_stand_alone_on_line(prefix: &str, commit_comment: Option<CommitSyntax<'_>>) -> bool {
+    if !prefix.contains(' ') && !can_start_line_in_mode(prefix, commit_comment) {
         return true;
     }
     if prefix.starts_with('<')
-        && !can_start_line(prefix)
+        && !can_start_line_in_mode(prefix, commit_comment)
         && find_angle_span_end(prefix, 0) == Some(prefix.len() - 1)
     {
         return true;
@@ -253,13 +273,106 @@ fn may_become_standalone_line(prefix: &str) -> bool {
     prefix.len() <= MAX_TRACKED_BYTES && prefix.starts_with(['$', '<', '@', '*', '+', '-', '_'])
 }
 
+/// Two-word commit hazards at column 0: `diff -...` (`git am` `patchbreak()` in `mailinfo.c`) and
+/// `Token :...` (`git interpret-trailers` spaced separator in `trailer.c`, or any other
+/// `trailer.separators` character).
+fn starts_two_word_commit_hazard(
+    word: &str,
+    next_word: Option<&str>,
+    commit: CommitSyntax<'_>,
+) -> bool {
+    let Some(next) = next_word else {
+        return false;
+    };
+    (word == "diff" && next.starts_with('-'))
+        || (preprocess::is_trailer_token_name(word)
+            && next.starts_with(|c| commit.trailer_separators.contains(c)))
+}
+
+/// Whether `words` joined with single spaces start with `bare_prefix` (`core.commentString`,
+/// which may span multiple whitespace-separated words).
+fn starts_comment_prefix<'a>(mut words: impl Iterator<Item = &'a str>, bare_prefix: &str) -> bool {
+    if bare_prefix.is_empty() {
+        return false;
+    }
+    let mut acc = String::new();
+    for word in &mut words {
+        if !acc.is_empty() {
+            acc.push(' ');
+        }
+        acc.push_str(word);
+        if acc.len() >= bare_prefix.len() {
+            return acc.starts_with(bare_prefix);
+        }
+        if !bare_prefix.starts_with(&acc) {
+            return false;
+        }
+    }
+    false
+}
+
+/// Whether `words` starting at column 0 would form a multi-word comment prefix (`// comment`),
+/// `diff -...` patch break, or spaced `Token :` trailer.
+fn starts_commit_sequence_hazard<'a>(
+    mut words: impl Iterator<Item = &'a str>,
+    commit: CommitSyntax<'_>,
+) -> bool {
+    let Some(first) = words.next() else {
+        return false;
+    };
+    let next = words.next();
+    if starts_two_word_commit_hazard(first, next, commit) {
+        return true;
+    }
+    let bare_prefix = commit.comment_prefix.trim_end_matches([' ', '\t']);
+    starts_comment_prefix(std::iter::once(first).chain(next).chain(words), bare_prefix)
+}
+
 /// Glues tokens that must not start a line onto their predecessor, and tokens following one
 /// that must not end a line onto it, so no reflow strategy can ever break between them.
 fn glue_line_hazards(
     tokens: Vec<WordToken>,
     preserve: bool,
     protected_prefix_tokens: usize,
+    commit_comment: Option<CommitSyntax<'_>>,
 ) -> Vec<WordToken> {
+    let sequence_hazards: Vec<bool> = (0..tokens.len())
+        .map(|i| {
+            commit_comment.is_some_and(|commit| {
+                let line_words = std::iter::once(&tokens[i])
+                    .chain(
+                        tokens[i + 1..]
+                            .iter()
+                            .take_while(|t| !preserve || !t.newline_before),
+                    )
+                    .flat_map(|t| t.text.split(' '));
+                starts_commit_sequence_hazard(line_words, commit)
+            })
+        })
+        .collect();
+    // Keep every word forming an existing or newly created sequence hazard on one line.
+    // Otherwise a second pass can mistake the split first line for a newly created hazard
+    // and add indentation (for example `Start :u` becoming `Start\n:u`).
+    let mut sequence_continuations = vec![false; tokens.len()];
+    if let Some(commit) = commit_comment {
+        for (start, &hazard) in sequence_hazards.iter().enumerate() {
+            if !hazard {
+                continue;
+            }
+            for end in start..tokens.len() {
+                if preserve && end > start && tokens[end].newline_before {
+                    break;
+                }
+                if starts_commit_sequence_hazard(
+                    tokens[start..=end].iter().flat_map(|t| t.text.split(' ')),
+                    commit,
+                ) {
+                    sequence_continuations[start + 1..end + 1].fill(true);
+                    break;
+                }
+            }
+        }
+    }
     let mut out: Vec<WordToken> = Vec::with_capacity(tokens.len());
     // The segment so far, as it would read if the line ended here. Every segment starts a line,
     // so a break must not follow a prefix that would read as its own block (`$$a$ $b$$`,
@@ -267,8 +380,10 @@ fn glue_line_hazards(
     let mut line_prefix = String::new();
     let mut track_prefix = !preserve;
     for (idx, tok) in tokens.into_iter().enumerate() {
-        let prefix_hazard =
-            track_prefix && !out.is_empty() && cannot_stand_alone_on_line(&line_prefix);
+        let two_word_hazard = sequence_hazards[idx];
+        let prefix_hazard = track_prefix
+            && !out.is_empty()
+            && cannot_stand_alone_on_line(&line_prefix, commit_comment);
         if track_prefix {
             if !line_prefix.is_empty() {
                 line_prefix.push(' ');
@@ -284,10 +399,12 @@ fn glue_line_hazards(
                     last.text.push(' ');
                     last.width += 1;
                 }
-            } else if !can_start_line(&tok.text)
+            } else if !can_start_line_in_mode(&tok.text, commit_comment)
+                || two_word_hazard
+                || sequence_continuations[idx]
                 || ends_with_hard_break(&last.text)
                 || idx < protected_prefix_tokens
-                || cannot_stand_alone_on_line(&last.text)
+                || cannot_stand_alone_on_line(&last.text, commit_comment)
                 || prefix_hazard
             {
                 last.text.push(' ');
@@ -301,18 +418,43 @@ fn glue_line_hazards(
     out
 }
 
+/// Which lines of a paragraph sit at column 0 of a commit message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommitLevel {
+    /// Inside an indented container: no segment starts at column 0.
+    Nested,
+    /// First paragraph of a root container with `--hanging-indent=0`: segment 0 starts after the
+    /// container marker, while segments after hard breaks start at column 0.
+    RootContinuation,
+    /// Top-level root paragraph: every segment starts at column 0.
+    Root,
+}
+
 /// Splits a raw paragraph into hard-break-separated segments and tokenizes each segment.
 ///
 /// Hard breaks outside code, math, HTML, and link destinations split the paragraph so each run is
 /// reflowed independently and re-terminated with the same style of break: a trailing `\`, or
 /// two trailing spaces. Other trailing whitespace is stripped and reflowed across.
-pub fn tokenize_paragraph(raw: &str, mode: WrapMode, protect_first_line: bool) -> Vec<Segment> {
+///
+/// `commit_comment` is the commit-message syntax in commit-message mode. When `commit_level`
+/// places a segment at column 0 of the file, a segment whose first line was indented keeps one
+/// space of indentation if dedenting it would start the line with a comment prefix, trailer key,
+/// or patch break. (Paragraphs with comment lines in them never get here: preprocessing keeps them
+/// as written.)
+pub(crate) fn tokenize_paragraph(
+    raw: &str,
+    mode: WrapMode,
+    protect_first_line: bool,
+    commit_comment: Option<CommitSyntax<'_>>,
+    commit_level: CommitLevel,
+) -> Vec<Segment> {
+    let preserve = mode == WrapMode::Preserve;
     let raw_segments = split_hard_break_segments(raw);
     // Definition and title syntax spans hard breaks (`[a]:  \n/url`, `[label  \ntwo]: /url`),
     // so find the protected prefix on the whole paragraph, then map it onto each segment.
     let joined = raw_segments
         .iter()
-        .map(|(text, _)| text.as_str())
+        .map(|segment| segment.text.as_str())
         .collect::<Vec<_>>()
         .join("\n");
     let title_end = if protect_first_line {
@@ -332,24 +474,99 @@ pub fn tokenize_paragraph(raw: &str, mode: WrapMode, protect_first_line: bool) -
     let mut segment_start = 0usize;
     raw_segments
         .into_iter()
-        .map(|(text, hard_break)| {
+        .enumerate()
+        .map(|(seg_idx, raw_segment)| {
+            let RawSegment {
+                text,
+                hard_break,
+                indented,
+            } = raw_segment;
             let segment_required_end = required_end.saturating_sub(segment_start).min(text.len());
             segment_start += text.len() + 1;
-            Segment {
-                tokens: tokenize_segment(&text, mode == WrapMode::Preserve, segment_required_end),
-                hard_break,
+            let mut tokens =
+                tokenize_segment(&text, preserve, segment_required_end, commit_comment);
+            // Preserve mode re-inserts source indentation itself.
+            if let Some(commit) = commit_comment.filter(|_| !preserve) {
+                match commit_level {
+                    CommitLevel::Nested => {}
+                    CommitLevel::RootContinuation if seg_idx == 0 => {}
+                    CommitLevel::RootContinuation => {
+                        keep_commit_hazard_indented(&mut tokens, commit);
+                    }
+                    CommitLevel::Root => {
+                        if indented {
+                            keep_commit_hazard_indented(&mut tokens, commit);
+                        } else {
+                            // Joining lines like `"//\ncomment"`, `"diff\n-u a b"`, or
+                            // `"Token\n: value"`, or collapsing the whitespace in `"diff  -u"`
+                            // or `"Index:\tfoo"`, would synthesize a comment line, `git am`
+                            // patch break, or trailer at column 0 that was not one in the
+                            // source. A first source line that is one exactly as written is left
+                            // as it is.
+                            let first_line = text.split('\n').next().unwrap_or("");
+                            let joined = tokens
+                                .iter()
+                                .map(|t| t.text.as_str())
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            let created = git_line_hazards(&joined, commit)
+                                .into_iter()
+                                .zip(git_line_hazards(first_line, commit))
+                                .any(|(after, before)| after && !before);
+                            if !tokens.is_empty() && created {
+                                tokens[0].text.insert(0, ' ');
+                                tokens[0].width += 1;
+                            }
+                        }
+                    }
+                }
             }
+            Segment { tokens, hard_break }
         })
         .collect()
 }
 
+/// Whether `line`, exactly as written at column 0, is a Git comment (starting with the comment
+/// prefix), a `git am` patch break (`mailinfo.c:patchbreak`: `diff -` or `Index: `), and a
+/// trailer line (`Token: value`, `Token : value`), in that order.
+fn git_line_hazards(line: &str, commit: CommitSyntax<'_>) -> [bool; 3] {
+    [
+        preprocess::is_commit_comment_line(line, commit.comment_prefix),
+        preprocess::is_git_patch_break(line),
+        preprocess::find_git_trailer_separator(line, commit.trailer_separators).is_some(),
+    ]
+}
+
+/// Prefixes the first token with a space when, dedented to column 0, it would turn the line into
+/// a Git comment, trailer, or patch break (CommonMark ignores the space at a line start).
+fn keep_commit_hazard_indented(tokens: &mut [WordToken], commit: CommitSyntax<'_>) {
+    let Some(first) = tokens.first() else {
+        return;
+    };
+    let first_word = first.text.split(' ').next().unwrap_or("");
+    let words = tokens.iter().flat_map(|t| t.text.split(' '));
+    if is_commit_line_hazard(first_word, commit) || starts_commit_sequence_hazard(words, commit) {
+        tokens[0].text.insert(0, ' ');
+        tokens[0].width += 1;
+    }
+}
+
+/// A run of paragraph source lines ending at a hard break (or the paragraph end).
+struct RawSegment {
+    text: String,
+    hard_break: Option<HardBreak>,
+    /// The segment's first source line started with whitespace.
+    indented: bool,
+}
+
 /// Splits `raw` into segments separated by hard line breaks (trailing `\` or 2+ trailing spaces),
 /// retaining source boundaries for preserve mode and keeping literal whitespace untouched.
-fn split_hard_break_segments(raw: &str) -> Vec<(String, Option<HardBreak>)> {
+fn split_hard_break_segments(raw: &str) -> Vec<RawSegment> {
     let normalized = raw.replace("\r\n", "\n");
     let raw_lines: Vec<&str> = normalized.split('\n').collect();
-    let mut segments: Vec<(String, Option<HardBreak>)> = Vec::new();
+    let mut segments: Vec<RawSegment> = Vec::new();
     let mut current_lines: Vec<String> = Vec::new();
+    let mut current_indented = false;
     let literal_spans = merged(literal_inline_ranges(&normalized));
     let mut line_start = 0usize;
 
@@ -364,6 +581,9 @@ fn split_hard_break_segments(raw: &str) -> Vec<(String, Option<HardBreak>)> {
         let line_end = line_start + raw_line.len();
         line_start = line_end + 1;
         let ends_in_literal = strictly_inside(&literal_spans, line_end);
+        if current_lines.is_empty() {
+            current_indented = !starts_in_literal && trimmed_start.len() < raw_line.len();
+        }
 
         let is_last_line = idx + 1 == raw_lines.len();
         let line_no_trailing_ws = trimmed_start.trim_end_matches([' ', '\t']);
@@ -372,7 +592,6 @@ fn split_hard_break_segments(raw: &str) -> Vec<(String, Option<HardBreak>)> {
             .rev()
             .take_while(|&b| b == b'\\')
             .count();
-
         let hard_break = if is_last_line || ends_in_literal || line_no_trailing_ws.is_empty() {
             None
         } else if trimmed_start.ends_with('\\') && trailing_backslashes % 2 == 1 {
@@ -393,7 +612,11 @@ fn split_hard_break_segments(raw: &str) -> Vec<(String, Option<HardBreak>)> {
             if !clean.is_empty() || current_lines.is_empty() {
                 current_lines.push(clean.to_string());
             }
-            segments.push((current_lines.join("\n"), Some(kind)));
+            segments.push(RawSegment {
+                text: current_lines.join("\n"),
+                hard_break: Some(kind),
+                indented: current_indented,
+            });
             current_lines.clear();
         } else {
             let clean = if ends_in_literal {
@@ -409,14 +632,22 @@ fn split_hard_break_segments(raw: &str) -> Vec<(String, Option<HardBreak>)> {
     }
 
     if !current_lines.is_empty() {
-        segments.push((current_lines.join("\n"), None));
+        segments.push(RawSegment {
+            text: current_lines.join("\n"),
+            hard_break: None,
+            indented: current_indented,
+        });
     } else if let Some(last) = segments.last_mut() {
         // A hard break at the very end of a paragraph is not a break.
-        last.1 = None;
+        last.hard_break = None;
     }
 
     if segments.is_empty() {
-        segments.push((String::new(), None));
+        segments.push(RawSegment {
+            text: String::new(),
+            hard_break: None,
+            indented: false,
+        });
     }
 
     segments
@@ -620,7 +851,12 @@ fn rejected_definition_hazard_end(text: &str) -> usize {
     skip_non_ws(bytes, after_dest)
 }
 
-fn tokenize_segment(segment: &str, preserve: bool, required_end: usize) -> Vec<WordToken> {
+fn tokenize_segment(
+    segment: &str,
+    preserve: bool,
+    required_end: usize,
+    commit_comment: Option<CommitSyntax<'_>>,
+) -> Vec<WordToken> {
     let mut atoms = scan_inline_atoms(segment, true);
     let k = if required_end == 0 {
         0
@@ -638,7 +874,7 @@ fn tokenize_segment(segment: &str, preserve: bool, required_end: usize) -> Vec<W
     let mut tokens = atoms_to_tokens(atoms);
     let glue_count = tokens.len();
     tokens.extend(atoms_to_tokens(tail_atoms));
-    glue_line_hazards(tokens, preserve, glue_count)
+    glue_line_hazards(tokens, preserve, glue_count, commit_comment)
 }
 
 fn scan_inline_atoms(s: &str, allow_links: bool) -> Vec<InlineAtom> {

@@ -89,6 +89,52 @@ fn push_normalized_component(
 /// File name searched for in each file's directory and its ancestors.
 pub const CONFIG_FILE_NAME: &str = ".markfmt.toml";
 
+/// Settings under `[commit_message]` in `.markfmt.toml`, applied only when formatting commit
+/// messages so documentation widths and excludes do not leak into `git commit`.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommitMessageSettings {
+    pub max_line_width: Option<usize>,
+    pub hanging_indent: Option<usize>,
+    pub align_table_columns: Option<bool>,
+    pub greedy: Option<bool>,
+    #[serde(default, with = "serde_wrap")]
+    pub wrap: Option<WrapMode>,
+    #[serde(default, with = "serde_ordered_lists")]
+    pub ordered_lists: Option<OrderedListStyle>,
+    pub comment_char: Option<String>,
+    pub trailer_separators: Option<String>,
+}
+
+/// Validates trailer separator characters (`--trailer-separators` or
+/// `[commit_message] trailer_separators`).
+pub fn validate_trailer_separators(s: &str) -> Result<(), String> {
+    if s.is_empty() {
+        return Err("trailer_separators must not be empty".to_string());
+    }
+    // Git matches separators byte by byte, so only ASCII punctuation means the same thing here.
+    if !s.chars().all(|c| c.is_ascii_punctuation()) {
+        return Err(
+            "trailer_separators must be ASCII punctuation (such as `:`, `-`, or `=`)".to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Validates a commit-message comment prefix (`--comment-char` or `[commit_message] comment_char`).
+pub fn validate_comment_char(s: &str) -> Result<(), String> {
+    if s.trim().is_empty() {
+        return Err("comment_char must not be empty".to_string());
+    }
+    if s.contains(['\n', '\r']) {
+        return Err("comment_char must not contain newlines".to_string());
+    }
+    if s.starts_with(char::is_whitespace) {
+        return Err("comment_char must not start with whitespace".to_string());
+    }
+    Ok(())
+}
+
 /// The settings a config file may contain. Unknown keys are rejected to catch typos.
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -104,6 +150,9 @@ pub struct Settings {
     /// Patterns (relative to the config file's directory) for files to skip.
     #[serde(default)]
     pub exclude: Vec<String>,
+    /// Commit-message-specific settings (`[commit_message]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_message: Option<CommitMessageSettings>,
 }
 
 /// Serde adapters that read and write the public option enums through their `*Name` spellings.
@@ -165,6 +214,22 @@ impl Config {
                 path.display()
             ));
         }
+        if let Some(cm) = &settings.commit_message {
+            if cm.max_line_width == Some(0) {
+                return Err(format!(
+                    "Invalid config `{}`: commit_message.max_line_width must be at least 1",
+                    path.display()
+                ));
+            }
+            if let Some(prefix) = &cm.comment_char {
+                validate_comment_char(prefix)
+                    .map_err(|err| format!("Invalid config `{}`: {err}", path.display()))?;
+            }
+            if let Some(separators) = &cm.trailer_separators {
+                validate_trailer_separators(separators)
+                    .map_err(|err| format!("Invalid config `{}`: {err}", path.display()))?;
+            }
+        }
         let base = normalized.parent().unwrap_or_else(|| Path::new("."));
         let excludes = ExcludeSet::new(base, &settings.exclude)
             .map_err(|err| format!("Invalid config `{}`: {err}", path.display()))?;
@@ -198,6 +263,38 @@ impl Config {
         }
     }
 
+    /// Applies this config's `[commit_message]` table (if any) on top of `options`, leaving
+    /// top-level documentation settings untouched.
+    pub fn apply_commit_message(&self, options: &mut FormattingOptions) {
+        let Some(cm) = &self.settings.commit_message else {
+            return;
+        };
+        if let Some(width) = cm.max_line_width {
+            options.max_line_width = width;
+        }
+        if let Some(indent) = cm.hanging_indent {
+            options.hanging_indent = Some(indent);
+        }
+        if let Some(align) = cm.align_table_columns {
+            options.align_table_columns = align;
+        }
+        if let Some(greedy) = cm.greedy {
+            options.optimal = !greedy;
+        }
+        if let Some(wrap) = cm.wrap {
+            options.wrap = wrap;
+        }
+        if let Some(style) = cm.ordered_lists {
+            options.ordered_lists = style;
+        }
+        if let Some(prefix) = &cm.comment_char {
+            options.comment_char.clone_from(prefix);
+        }
+        if let Some(separators) = &cm.trailer_separators {
+            options.trailer_separators.clone_from(separators);
+        }
+    }
+
     /// Serializes effective settings using the same keys accepted by project configuration.
     /// `exclude` is the applicable config file's patterns (relative to that file).
     pub fn resolved_settings(options: &FormattingOptions, exclude: &[String]) -> Settings {
@@ -209,6 +306,16 @@ impl Config {
             wrap: Some(options.wrap),
             ordered_lists: Some(options.ordered_lists),
             exclude: exclude.to_vec(),
+            commit_message: options.commit_message.then(|| CommitMessageSettings {
+                max_line_width: Some(options.max_line_width),
+                hanging_indent: options.hanging_indent,
+                align_table_columns: Some(options.align_table_columns),
+                greedy: Some(!options.optimal),
+                wrap: Some(options.wrap),
+                ordered_lists: Some(options.ordered_lists),
+                comment_char: Some(options.comment_char.clone()),
+                trailer_separators: Some(options.trailer_separators.clone()),
+            }),
         }
     }
 

@@ -420,6 +420,19 @@ fn prompt_tags_after_prose_or_lists_stay_on_their_own_lines() {
     let nested = "- item\n  <rules>\n  text\n";
     assert_format(nested, nested, &options(72));
     assert_round_trip(nested, &options(72));
+
+    // A column-0 prompt tag inside a list, heading, or paragraph must not strip container or
+    // continuation context from lines that follow it, nor let a narrowed list absorb a following
+    // indented HTML block across the tag.
+    for mid_block in [
+        "- item\n<rules>\n  ---\n</rules>\n",
+        "- item\n<rules>\n  - nested\n</rules>\n",
+        "- item\n<rules>\n  > quote\n</rules>\n",
+        "Paragraph\n<rules>\n    indented\nfollowing\n</rules>\n",
+        "-   item\n<rules>\n  <div>html</div>\n</rules>\n",
+    ] {
+        assert_round_trip(mid_block, &options(72));
+    }
 }
 
 #[test]

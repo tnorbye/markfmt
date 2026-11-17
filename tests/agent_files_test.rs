@@ -83,6 +83,12 @@ fn standalone_xml_prompt_tags_and_at_imports_allow_inner_reflow() {
         "</details>\n",
     );
     common::assert_format(input, expected, &opts);
+
+    // Inline math on its own line inside a prompt tag continues the paragraph rather than
+    // detaching as a blank-line-separated display-math block (which would close HTML Rule 7).
+    let prompt_math = "<rules>\nText here\n$$x$$\n</rules>\n";
+    common::assert_round_trip(prompt_math, &opts);
+    common::assert_format(prompt_math, "<rules>\nText here $$x$$\n</rules>\n", &opts);
 }
 
 #[test]

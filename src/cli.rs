@@ -66,13 +66,30 @@ fn parse_positive_usize(s: &str) -> Result<usize, String> {
     Ok(val)
 }
 
+fn parse_comment_char(s: &str) -> Result<String, String> {
+    crate::config::validate_comment_char(s)?;
+    Ok(s.to_string())
+}
+
+fn parse_trailer_separators(s: &str) -> Result<String, String> {
+    crate::config::validate_trailer_separators(s)?;
+    Ok(s.to_string())
+}
+
+fn parse_editor_cmd(s: &str) -> Result<String, String> {
+    if s.trim().is_empty() {
+        return Err("--commit-editor command must not be empty".to_string());
+    }
+    Ok(s.to_string())
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "markfmt",
     version,
     before_help = concat!("markfmt ", env!("CARGO_PKG_VERSION")),
-    about = "Reflow and format Markdown, Markdeep, and AI agent instruction/skill files.",
-    long_about = "Reflow and format Markdown, Markdeep, and AI agent instruction/skill files.\n\n\
+    about = "Reflow and format Markdown, Markdeep, AI agent instruction/skill files, and commit messages.",
+    long_about = "Reflow and format Markdown, Markdeep, AI agent instruction/skill files, and commit messages.\n\n\
         Inspired by kdoc-formatter (https://github.com/tnorbye/kdoc-formatter). Uses optimal\n\
         Knuth-Plass paragraph balancing for longer paragraphs (4+ lines) and preserves\n\
         existing Markdown syntax choices, Mermaid/code blocks, YAML frontmatter, and symlinks.\n\n\
@@ -140,6 +157,49 @@ pub struct Cli {
     )]
     pub ordered_lists: Option<OrderedListStyle>,
 
+    /// Format as a Git or Jujutsu commit message (preserving subject, trailers, and comments)
+    #[arg(long = "commit-msg", visible_alias = "commit-message")]
+    pub commit_msg: bool,
+
+    /// Launch CMD (or $MARKFMT_EDITOR / $VISUAL / $EDITOR) to edit files, then format commit messages
+    #[arg(
+        long = "commit-editor",
+        value_name = "CMD",
+        value_hint = clap::ValueHint::CommandString,
+        num_args = 0..=1,
+        require_equals = true,
+        value_parser = parse_editor_cmd,
+        conflicts_with_all = [
+            "check",
+            "diff",
+            "dry_run",
+            "print_config",
+            "explain",
+            "lines",
+            "overlaps_git_changes"
+        ]
+    )]
+    pub commit_editor: Option<Option<String>>,
+
+    /// Comment line prefix in commit-message mode (e.g. `#`, `;`, `//`, or `auto`)
+    #[arg(
+        long = "comment-char",
+        value_name = "CHAR",
+        value_hint = clap::ValueHint::Other,
+        value_parser = parse_comment_char
+    )]
+    pub comment_char: Option<String>,
+
+    /// Trailer key/value separator characters in commit-message mode (default from Git's
+    /// `trailer.separators`, else `:`)
+    #[arg(
+        long = "trailer-separators",
+        value_name = "CHARS",
+        value_hint = clap::ValueHint::Other,
+        value_parser = parse_trailer_separators
+    )]
+    pub trailer_separators: Option<String>,
+
     /// Do not read .editorconfig files
     #[arg(long = "no-editorconfig")]
     pub no_editorconfig: bool,
@@ -191,7 +251,7 @@ pub struct Cli {
     )]
     pub lines: Vec<String>,
 
-    /// Virtual file path when formatting stdin (`-`) for .editorconfig/Markdeep
+    /// Virtual file path when formatting stdin (`-`) for .editorconfig/Markdeep/commit detection
     #[arg(long = "stdin-filepath", value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
     pub stdin_filepath: Option<String>,
 
@@ -257,6 +317,8 @@ impl Cli {
             optimal,
             wrap: self.wrap,
             ordered_lists: self.ordered_lists,
+            comment_char: self.comment_char.clone(),
+            trailer_separators: self.trailer_separators.clone(),
         }
     }
 }

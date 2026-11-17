@@ -35,6 +35,7 @@ struct BlockUnit {
     tight_after: bool,
     is_paragraph: bool,
     is_list: bool,
+    is_standalone: bool,
     /// Copied verbatim (code, HTML, ignored regions): its lines already carry their indentation
     /// relative to the container's content column, so it must not take a wider hanging indent
     /// (that would shift indented code content and drift further on every run).
@@ -52,6 +53,7 @@ impl BlockUnit {
             tight_after: false,
             is_paragraph: false,
             is_list: false,
+            is_standalone: false,
             keeps_source_indent: false,
         }
     }
@@ -71,6 +73,7 @@ struct FirstParaOverride<'a> {
     first_width: usize,
     rest_indent: usize,
     rest_width: usize,
+    root_continuations: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -182,19 +185,36 @@ pub fn format_file_content(
     }
 
     let normalized = input.replace("\r\n", "\n");
-    let is_markdeep = options
-        .markdeep
-        .unwrap_or_else(|| preprocess::has_markdeep_markers(&normalized));
+    let resolved_opts;
+    let comment_prefix = options
+        .commit_message
+        .then(|| preprocess::resolve_comment_prefix(&normalized, &options.comment_char))
+        .filter(|prefix| *prefix != options.comment_char);
+    let options = if let Some(prefix) = comment_prefix {
+        let mut cloned = options.clone();
+        cloned.comment_char = prefix.to_string();
+        resolved_opts = cloned;
+        &resolved_opts
+    } else {
+        options
+    };
+    let is_markdeep = options.markdeep.unwrap_or_else(|| {
+        !options.commit_message && preprocess::has_markdeep_markers(&normalized)
+    });
 
-    let units = format_block_units(
-        &normalized,
-        1,
-        options.max_line_width,
-        true,
-        is_markdeep,
-        options,
-        None,
-    );
+    let units = if options.commit_message {
+        format_commit_message_units(&normalized, is_markdeep, options)
+    } else {
+        format_block_units(
+            &normalized,
+            1,
+            options.max_line_width,
+            true,
+            is_markdeep,
+            options,
+            None,
+        )
+    };
 
     if !range_filter.is_filtered() {
         let mut out = render_root_units(&units, eol);
@@ -218,9 +238,16 @@ fn render_root_units(units: &[BlockUnit], eol: &str) -> String {
 }
 
 fn join_block_unit_lines(units: &[BlockUnit]) -> Vec<String> {
+    join_block_unit_lines_with_ranges(units).0
+}
+
+/// [`join_block_unit_lines`], also returning the output line indices of each unit.
+fn join_block_unit_lines_with_ranges(units: &[BlockUnit]) -> (Vec<String>, Vec<Range<usize>>) {
     let mut out_lines = Vec::new();
+    let mut ranges = Vec::with_capacity(units.len());
     for (idx, unit) in units.iter().enumerate() {
         if unit.lines.is_empty() {
+            ranges.push(out_lines.len()..out_lines.len());
             continue;
         }
         if !out_lines.is_empty() {
@@ -232,9 +259,11 @@ fn join_block_unit_lines(units: &[BlockUnit]) -> Vec<String> {
                 out_lines.push(String::new());
             }
         }
+        let start = out_lines.len();
         out_lines.extend(unit.lines.iter().cloned());
+        ranges.push(start..out_lines.len());
     }
-    out_lines
+    (out_lines, ranges)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -332,6 +361,323 @@ fn splice_filtered_units(
     out
 }
 
+fn format_commit_message_units(
+    normalized: &str,
+    is_markdeep: bool,
+    options: &FormattingOptions,
+) -> Vec<BlockUnit> {
+    // `format_file_content` has already resolved `auto` to a concrete prefix.
+    let comment_prefix = options.comment_char.as_str();
+    let split = preprocess::split_commit_tail(normalized, comment_prefix);
+    let head = &normalized[..split.head_end];
+
+    // An empty or comment-only commit buffer (`git commit` aborted without typing a message) stays
+    // byte-for-byte intact so Git still sees an empty message and aborts cleanly.
+    if head.trim().is_empty() {
+        let raw_trimmed = normalized.strip_suffix('\n').unwrap_or(normalized);
+        let lines = raw_lines_verbatim(raw_trimmed);
+        let end_line = lines.len().max(1);
+        return vec![BlockUnit::verbatim(lines, 1, end_line)];
+    }
+
+    let mut units = format_block_units(
+        head,
+        1,
+        options.max_line_width,
+        true,
+        is_markdeep,
+        options,
+        None,
+    );
+    preserve_units_creating_commit_syntax(head, &mut units, comment_prefix);
+    let commit = preprocess::CommitSyntax {
+        comment_prefix,
+        trailer_separators: &options.trailer_separators,
+        trailer_keys: &options.trailer_keys,
+    };
+    keep_blank_lines_before_frontmatter(head, &mut units, commit);
+
+    let has_tail = split.tail_range.is_some();
+    if let Some(tail_range) = split.tail_range {
+        let tail_lines = raw_lines_verbatim(&normalized[tail_range]);
+        // The head was trimmed before preprocessing, so its last standalone tag may appear
+        // attached to whatever follows. The original separator takes precedence here.
+        if split.had_blank_before_tail {
+            if let Some(last) = units.last_mut() {
+                last.tight_after = false;
+            }
+        }
+        units.push(BlockUnit {
+            tight_before: !split.had_blank_before_tail,
+            ..BlockUnit::verbatim(tail_lines, split.tail_start_line, split.tail_end_line)
+        });
+    }
+    // Include the tail: Git reads Jujutsu's `JJ:` comments as text or trailers.
+    preserve_git_trailer_interpretation(normalized, &mut units, commit, has_tail);
+
+    units
+}
+
+/// Ensures block normalization at root level (such as trimming indentation on rules, tables,
+/// blockquotes, or standalone lines) never turns a non-comment line into a comment line,
+/// introduces a `---` Git patch divider above the existing divider, or creates or removes a
+/// `git am` patch break (`diff -`, `Index: `).
+fn preserve_units_creating_commit_syntax(
+    head: &str,
+    units: &mut [BlockUnit],
+    comment_prefix: &str,
+) {
+    let raw_trimmed = head.strip_suffix('\n').unwrap_or(head);
+    let head_lines: Vec<&str> = raw_trimmed.split('\n').collect();
+    let divider_line = head_lines
+        .iter()
+        .position(|l| preprocess::is_git_patch_divider(l))
+        .map_or(usize::MAX, |idx| idx + 1);
+    for unit in &mut *units {
+        if unit.keeps_source_indent
+            || unit.start_line == 0
+            || unit.end_line < unit.start_line
+            || unit.end_line > head_lines.len()
+        {
+            continue;
+        }
+        let orig = &head_lines[unit.start_line - 1..unit.end_line];
+        let orig_comments = orig
+            .iter()
+            .filter(|l| preprocess::is_commit_comment_line(l, comment_prefix))
+            .count();
+        let new_comments = unit
+            .lines
+            .iter()
+            .filter(|l| preprocess::is_commit_comment_line(l, comment_prefix))
+            .count();
+        let patch_breaks = |lines: &mut dyn Iterator<Item = &str>| {
+            lines.filter(|l| preprocess::is_git_patch_break(l)).count()
+        };
+        let patch_break_changed = patch_breaks(&mut orig.iter().copied())
+            != patch_breaks(&mut unit.lines.iter().map(String::as_str));
+        let divider_changed = unit.end_line <= divider_line
+            && orig.iter().any(|l| preprocess::is_git_patch_divider(l))
+                != unit
+                    .lines
+                    .iter()
+                    .any(|l| preprocess::is_git_patch_divider(l));
+        if new_comments != orig_comments || divider_changed || patch_break_changed {
+            *unit = BlockUnit {
+                tight_before: unit.tight_before,
+                tight_after: unit.tight_after,
+                is_list: unit.is_list,
+                ..BlockUnit::verbatim(
+                    orig.iter().map(|s| (*s).to_string()).collect(),
+                    unit.start_line,
+                    unit.end_line,
+                )
+            };
+        }
+    }
+
+    // Restoring or keeping a 2+-column-indented block after a list whose marker was narrowed
+    // (for instance `-   item` -> `- item`, even across an attached standalone prompt tag) would
+    // move that block inside the list item; keep the preceding list's source layout as well so
+    // their relative indentation is preserved.
+    preserve_lists_before_indented_verbatims(&head_lines, units, Some(comment_prefix));
+}
+
+fn preserve_lists_before_indented_verbatims(
+    head_lines: &[&str],
+    units: &mut [BlockUnit],
+    comment_prefix: Option<&str>,
+) {
+    for i in (1..units.len()).rev() {
+        let lead = units[i]
+            .lines
+            .first()
+            .map_or(0, |l| preprocess::leading_ws_columns(l, TAB_STOP).0);
+        if !units[i].keeps_source_indent || lead < 2 {
+            continue;
+        }
+        let Some(prev_idx) = (0..i).rev().find(|&j| {
+            let comment_only = comment_prefix.is_some_and(|prefix| {
+                units[j]
+                    .lines
+                    .iter()
+                    .all(|l| l.trim().is_empty() || preprocess::is_commit_comment_line(l, prefix))
+            });
+            let lazy_standalone = units[j].is_standalone && units[j].tight_before;
+            !comment_only && !lazy_standalone
+        }) else {
+            continue;
+        };
+        let prev = &units[prev_idx];
+        if prev.is_list
+            && !prev.keeps_source_indent
+            && prev.start_line > 0
+            && prev.end_line >= prev.start_line
+            && prev.end_line <= head_lines.len()
+        {
+            let orig = &head_lines[prev.start_line - 1..prev.end_line];
+            units[prev_idx] = BlockUnit {
+                tight_before: prev.tight_before,
+                tight_after: prev.tight_after,
+                is_list: true,
+                ..BlockUnit::verbatim(
+                    orig.iter().map(|s| (*s).to_string()).collect(),
+                    prev.start_line,
+                    prev.end_line,
+                )
+            };
+        }
+    }
+}
+
+/// Keeps the blank lines that open `head` when the formatted text after them would read as
+/// frontmatter: without them, the next pass would format it differently (Git ignores leading
+/// blank lines either way).
+fn keep_blank_lines_before_frontmatter(
+    head: &str,
+    units: &mut Vec<BlockUnit>,
+    commit: preprocess::CommitSyntax<'_>,
+) {
+    let blank_lines = head
+        .split_inclusive('\n')
+        .take_while(|line| line.trim().is_empty())
+        .count();
+    if blank_lines == 0
+        || units.first().is_some_and(|u| u.start_line <= blank_lines)
+        || !preprocess::starts_with_root_frontmatter(&render_root_units(units, "\n"), Some(commit))
+    {
+        return;
+    }
+    units.insert(
+        0,
+        BlockUnit {
+            tight_after: true,
+            ..BlockUnit::verbatim(vec![String::new(); blank_lines], 1, blank_lines)
+        },
+    );
+}
+
+/// The trailer lines Git parses from `text` (`git interpret-trailers --parse`, before
+/// unfolding), or `None` if it finds no trailer block.
+fn git_trailer_lines(text: &str, commit: preprocess::CommitSyntax<'_>) -> Option<Vec<String>> {
+    let candidate =
+        preprocess::find_git_trailer_candidate_in(text, commit).filter(|c| c.is_block)?;
+    let lines: Vec<&str> = text
+        .strip_suffix('\n')
+        .unwrap_or(text)
+        .split('\n')
+        .collect();
+    Some(
+        lines[candidate.lines]
+            .iter()
+            .filter(|l| !preprocess::is_git_comment_line(l, commit.comment_prefix))
+            .map(|l| (*l).to_string())
+            .collect(),
+    )
+}
+
+/// Ensures formatting `message` leaves the trailers Git parses unchanged: reflowing or
+/// normalizing blocks can join lines into a trailer (`https://...` joined onto one line), add
+/// or remove the blank line that starts Git's trailer block (around a fence, or before the
+/// message), or change what the block holds. The units Git reads differently are kept as
+/// written, with their original blank-line separation; if that is not enough, so is the whole
+/// message.
+fn preserve_git_trailer_interpretation(
+    message: &str,
+    units: &mut Vec<BlockUnit>,
+    commit: preprocess::CommitSyntax<'_>,
+    has_tail: bool,
+) {
+    let expected = git_trailer_lines(message, commit);
+    let render = |units: &[BlockUnit]| render_root_units(units, "\n");
+    if git_trailer_lines(&render(units), commit) == expected {
+        return;
+    }
+    let source_lines: Vec<&str> = message
+        .strip_suffix('\n')
+        .unwrap_or(message)
+        .split('\n')
+        .collect();
+    let line_count = source_lines.len();
+    let verbatim_lines = |start: usize, end: usize| -> BlockUnit {
+        BlockUnit {
+            tight_before: start > 1 && !source_lines[start - 2].trim().is_empty(),
+            tight_after: end < line_count && !source_lines[end].trim().is_empty(),
+            ..BlockUnit::verbatim(
+                source_lines[start - 1..end]
+                    .iter()
+                    .map(|l| (*l).to_string())
+                    .collect(),
+                start,
+                end,
+            )
+        }
+    };
+    let in_message = |u: &BlockUnit| u.start_line >= 1 && u.end_line <= line_count;
+
+    // The units Git reads as (or around) the trailer block, before and after formatting.
+    let mut picked: Vec<usize> = Vec::new();
+    if let Some(orig) = preprocess::find_git_trailer_candidate_in(message, commit) {
+        let (start, end) = (orig.lines.start + 1, orig.lines.end);
+        picked.extend(
+            (0..units.len()).filter(|&i| units[i].end_line >= start && units[i].start_line <= end),
+        );
+    }
+    // Restoring just the units in the block Git finds after formatting usually suffices. If not,
+    // the unit before it is restored too: the blank line between them is what Git reads. The
+    // block starts right after that blank line, so the unit before it ends (exclusively) at
+    // the blank line, `after.lines.start - 1`.
+    let mut attempts = vec![picked.clone()];
+    let rendered = render(units);
+    if let Some(after) = preprocess::find_git_trailer_candidate_in(&rendered, commit) {
+        let (_, ranges) = join_block_unit_lines_with_ranges(units);
+        let overlapping = |after_start: usize| {
+            (0..units.len())
+                .filter(|&i| ranges[i].start < after.lines.end && ranges[i].end > after_start)
+                .collect::<Vec<_>>()
+        };
+        attempts[0].extend(overlapping(after.lines.start.saturating_sub(1)));
+        attempts.push(
+            picked
+                .iter()
+                .copied()
+                .chain(overlapping(after.lines.start.saturating_sub(2)))
+                .collect(),
+        );
+    }
+    for picked in attempts {
+        let (Some(&first), Some(&last)) = (picked.iter().min(), picked.iter().max()) else {
+            continue;
+        };
+        if !(first..=last).all(|i| in_message(&units[i])) {
+            continue;
+        }
+        // Leading blank lines before the first unit can start Git's trailer search.
+        let start = if first == 0 {
+            1
+        } else {
+            units[first].start_line
+        };
+        let end = units[last].end_line.max(start);
+        let mut candidate = units.clone();
+        candidate.splice(first..=last, [verbatim_lines(start, end)]);
+        if git_trailer_lines(&render(&candidate), commit) == expected {
+            *units = candidate;
+            return;
+        }
+    }
+    // A detached comment/scissors tail is verbatim, including its trailing blank lines.
+    let end = if has_tail {
+        line_count
+    } else {
+        source_lines
+            .iter()
+            .rposition(|l| !l.trim().is_empty())
+            .map_or(1, |i| i + 1)
+    };
+    *units = vec![verbatim_lines(1, end)];
+}
+
 fn format_block_units(
     text: &str,
     base_line: usize,
@@ -341,18 +687,13 @@ fn format_block_units(
     options: &FormattingOptions,
     first_para_override: Option<FirstParaOverride<'_>>,
 ) -> Vec<BlockUnit> {
-    let segments = preprocess::preprocess(text, is_root, is_markdeep);
+    let segments = preprocess::preprocess(text, is_root, is_markdeep, options.commit_syntax());
     let mut units: Vec<BlockUnit> = Vec::new();
     let mut para_override = first_para_override;
 
     for seg in segments {
         match seg {
             PreSegment::Frontmatter {
-                range,
-                start_line,
-                end_line,
-            }
-            | PreSegment::Verbatim {
                 range,
                 start_line,
                 end_line,
@@ -364,6 +705,25 @@ fn format_block_units(
                     base_line + start_line - 1,
                     base_line + end_line - 1,
                 ));
+            }
+            PreSegment::Verbatim {
+                range,
+                start_line,
+                end_line,
+                tight_before,
+                tight_after,
+            } => {
+                para_override = None;
+                let lines = raw_lines_verbatim(&text[range]);
+                units.push(BlockUnit {
+                    tight_before,
+                    tight_after,
+                    ..BlockUnit::verbatim(
+                        lines,
+                        base_line + start_line - 1,
+                        base_line + end_line - 1,
+                    )
+                });
             }
             PreSegment::StandaloneLine {
                 text: line_text,
@@ -377,6 +737,7 @@ fn format_block_units(
                 units.push(BlockUnit {
                     tight_before: !blank_before,
                     tight_after: !blank_after,
+                    is_standalone: true,
                     ..BlockUnit::new(
                         vec![line_text],
                         base_line + start_line - 1,
@@ -414,6 +775,7 @@ fn format_block_units(
                     blank_after_term,
                     &definitions,
                     width,
+                    is_root,
                     is_markdeep,
                     options,
                 );
@@ -430,6 +792,7 @@ fn format_block_units(
                     chunk,
                     chunk_base_line,
                     width,
+                    is_root,
                     is_markdeep,
                     options,
                     para_override.take(),
@@ -437,6 +800,12 @@ fn format_block_units(
                 units.append(&mut chunk_units);
             }
         }
+    }
+
+    if is_root && !options.commit_message {
+        let raw_trimmed = text.strip_suffix('\n').unwrap_or(text);
+        let all_lines: Vec<&str> = raw_trimmed.split('\n').collect();
+        preserve_lists_before_indented_verbatims(&all_lines, &mut units, None);
     }
 
     units
@@ -512,6 +881,7 @@ fn format_definition_list(
     blank_after_term: bool,
     definitions: &[(String, String)],
     width: usize,
+    is_root: bool,
     is_markdeep: bool,
     options: &FormattingOptions,
 ) -> Vec<String> {
@@ -527,6 +897,7 @@ fn format_definition_list(
             marker_prefix,
             ContainerIndent::for_marker(options, marker_prefix.len()),
             width,
+            is_root,
             is_markdeep,
             options,
         );
@@ -540,6 +911,7 @@ fn format_markdown_chunk(
     chunk: &str,
     base_line: usize,
     width: usize,
+    is_root: bool,
     is_markdeep: bool,
     options: &FormattingOptions,
     mut first_para_override: Option<FirstParaOverride<'_>>,
@@ -596,6 +968,7 @@ fn format_markdown_chunk(
             &item,
             &line_index,
             width,
+            is_root,
             is_markdeep,
             options,
             use_override,
@@ -902,11 +1275,13 @@ fn trim_trailing_blank_end(s: &str, start: usize, end: usize) -> usize {
     e
 }
 
+#[allow(clippy::too_many_arguments)]
 fn format_top_ast_item(
     chunk: &str,
     item: &TopAstItem,
     line_index: &LineIndex,
     width: usize,
+    is_root: bool,
     is_markdeep: bool,
     options: &FormattingOptions,
     first_para_override: Option<FirstParaOverride<'_>>,
@@ -936,6 +1311,7 @@ fn format_top_ast_item(
             let lines = format_paragraph_lines(
                 raw_slice,
                 width,
+                is_root,
                 options,
                 first_para_override,
                 *follows_definition,
@@ -946,7 +1322,11 @@ fn format_top_ast_item(
             }
         }
         TopAstItem::Heading(_) => {
-            let lines = format_heading_lines(raw_slice);
+            let root_commit_prefix = options
+                .commit_message
+                .then_some(options.comment_char.as_str())
+                .filter(|_| is_root);
+            let lines = format_heading_lines(raw_slice, options.commit_message, root_commit_prefix);
             BlockUnit::new(lines, start_line, end_line)
         }
         TopAstItem::CodeBlock {
@@ -971,20 +1351,52 @@ fn format_top_ast_item(
             BlockUnit::verbatim(lines, start_line, line_index.line_at(end.saturating_sub(1)))
         }
         TopAstItem::Rule(_) => {
+            let root_commit_prefix = options
+                .commit_message
+                .then_some(options.comment_char.as_str())
+                .filter(|_| is_root);
+            let orig_has_divider = raw_slice.lines().any(preprocess::is_git_patch_divider);
+            let orig_has_comment = root_commit_prefix.is_some_and(|prefix| {
+                raw_slice
+                    .lines()
+                    .any(|l| preprocess::is_commit_comment_line(l, prefix))
+            });
             let trimmed_lines: Vec<String> = raw_slice
                 .lines()
                 .map(|l| l.trim().to_string())
                 .filter(|l| !l.is_empty())
+                .map(|mut l| {
+                    let creates_divider = root_commit_prefix.is_some()
+                        && !orig_has_divider
+                        && preprocess::is_git_patch_divider(&l);
+                    let creates_comment = root_commit_prefix.is_some_and(|prefix| {
+                        !orig_has_comment && preprocess::is_commit_comment_line(&l, prefix)
+                    });
+                    if creates_divider || creates_comment {
+                        l.insert(0, ' ');
+                    }
+                    l
+                })
                 .collect();
             BlockUnit::new(trimmed_lines, start_line, end_line)
         }
         TopAstItem::Table(_) => {
-            let lines = if options.align_table_columns {
+            let mut lines = if options.align_table_columns {
                 table::format_table(raw_slice, "")
                     .unwrap_or_else(|| raw_lines_trimmed_end(raw_slice))
             } else {
                 raw_lines_trimmed_end(raw_slice)
             };
+            // Table alignment can resize delimiter runs, add outer pipes, or fill missing
+            // cells. Commit messages permit only whitespace changes, so keep the source when
+            // the aligned table would change its words.
+            if options.commit_message
+                && !raw_slice
+                    .split_whitespace()
+                    .eq(lines.iter().flat_map(|line| line.split_whitespace()))
+            {
+                lines = raw_lines_trimmed_end(raw_slice);
+            }
             BlockUnit::new(lines, start_line, end_line)
         }
         TopAstItem::BlockQuote { is_alert, .. } => {
@@ -1001,6 +1413,7 @@ fn format_top_ast_item(
                 range.clone(),
                 item_ranges,
                 width,
+                is_root,
                 is_markdeep,
                 options,
                 *preserve_layout,
@@ -1040,11 +1453,27 @@ fn raw_lines_trimmed_end(raw: &str) -> Vec<String> {
 fn format_paragraph_lines(
     raw: &str,
     width: usize,
+    is_root: bool,
     options: &FormattingOptions,
     first_para_override: Option<FirstParaOverride<'_>>,
     protect_first_line: bool,
 ) -> Vec<String> {
-    let segments = inline::tokenize_paragraph(raw, options.wrap, protect_first_line);
+    let commit_comment = options.commit_syntax();
+    let commit_level = if is_root {
+        inline::CommitLevel::Root
+    } else if first_para_override.is_some_and(|ov| ov.root_continuations) {
+        inline::CommitLevel::RootContinuation
+    } else {
+        inline::CommitLevel::Nested
+    };
+    let protect_root = commit_level != inline::CommitLevel::Nested;
+    let segments = inline::tokenize_paragraph(
+        raw,
+        options.wrap,
+        protect_first_line,
+        commit_comment,
+        commit_level,
+    );
     let mut out_lines: Vec<String> = Vec::new();
     let source_indents = if options.wrap == crate::options::WrapMode::Preserve {
         inline::preserved_line_indents(raw)
@@ -1076,6 +1505,7 @@ fn format_paragraph_lines(
             seg_lines.push(String::new());
         }
 
+        let seg_source_line = source_line;
         if options.wrap == crate::options::WrapMode::Preserve {
             for line in &mut seg_lines {
                 if let Some(indent) = source_indents.get(source_line) {
@@ -1107,6 +1537,27 @@ fn format_paragraph_lines(
             }
         }
 
+        if options.wrap == crate::options::WrapMode::Preserve
+            && protect_root
+            && options.commit_message
+        {
+            let skip = usize::from(first_para_override.is_some() && seg_idx == 0);
+            // Preserve mode keeps one output line per source line. Collapsing whitespace (such
+            // as `diff  -u` or `Index:\tfoo`) must not create a `git am` patch break either.
+            let raw_lines: Vec<&str> = raw.split('\n').collect();
+            for (k, line) in seg_lines.iter_mut().enumerate().skip(skip) {
+                let created_patch_break = preprocess::is_git_patch_break(line)
+                    && !raw_lines
+                        .get(seg_source_line + k)
+                        .is_some_and(|orig| preprocess::is_git_patch_break(orig));
+                if preprocess::is_commit_comment_line(line, &options.comment_char)
+                    || created_patch_break
+                {
+                    line.insert(0, ' ');
+                }
+            }
+        }
+
         if let Some(hard_break) = segment.hard_break {
             if let Some(last) = seg_lines.last_mut() {
                 last.push_str(hard_break.marker());
@@ -1119,7 +1570,11 @@ fn format_paragraph_lines(
     out_lines
 }
 
-fn format_heading_lines(raw: &str) -> Vec<String> {
+fn format_heading_lines(
+    raw: &str,
+    commit_message: bool,
+    root_commit_prefix: Option<&str>,
+) -> Vec<String> {
     let raw_lines: Vec<&str> = raw.split('\n').collect();
     if raw_lines.len() >= 2 {
         let last_trimmed = raw_lines[raw_lines.len() - 1].trim();
@@ -1129,7 +1584,15 @@ fn format_heading_lines(raw: &str) -> Vec<String> {
             // Multiline headings can contain significant indentation, hard breaks, and
             // inline literals crossing lines. Preserve that body and normalize its underline.
             let mut content_lines: Vec<String> = if raw_lines.len() == 2 {
-                vec![collapse_inline_spaces(raw_lines[0])]
+                let mut line0 = collapse_inline_spaces(raw_lines[0]);
+                if root_commit_prefix.is_some_and(|prefix| {
+                    preprocess::is_commit_comment_line(&line0, prefix)
+                        || (preprocess::is_git_patch_break(&line0)
+                            && !preprocess::is_git_patch_break(raw_lines[0]))
+                }) {
+                    line0.insert(0, ' ');
+                }
+                vec![line0]
             } else {
                 raw_lines[..raw_lines.len() - 1]
                     .iter()
@@ -1141,8 +1604,26 @@ fn format_heading_lines(raw: &str) -> Vec<String> {
                 .map(|line| UnicodeWidthStr::width(line.as_str()))
                 .max()
                 .unwrap_or(0);
-            let underline_ch = last_trimmed.chars().next().unwrap_or('=');
-            let underline: String = std::iter::repeat_n(underline_ch, max_w.max(3)).collect();
+            let raw_underline = raw_lines[raw_lines.len() - 1];
+            let mut underline: String = if commit_message {
+                // Git reads even a nested heading's underline as a word of the message.
+                last_trimmed.to_string()
+            } else {
+                let underline_ch = last_trimmed.chars().next().unwrap_or('=');
+                std::iter::repeat_n(underline_ch, max_w.max(3)).collect()
+            };
+            // Dedenting a root underline must not create a `---` patch divider.
+            if root_commit_prefix.is_some()
+                && preprocess::is_git_patch_divider(&underline)
+                && !preprocess::is_git_patch_divider(raw_underline)
+            {
+                underline.insert(0, ' ');
+            }
+            if root_commit_prefix
+                .is_some_and(|prefix| preprocess::is_commit_comment_line(&underline, prefix))
+            {
+                underline.insert(0, ' ');
+            }
             content_lines.push(underline);
             return content_lines;
         }
@@ -1161,38 +1642,51 @@ fn format_heading_lines(raw: &str) -> Vec<String> {
     }
     let prefix = &line[..hashes];
     let after = line[hashes..].trim_start_matches([' ', '\t']);
-    if after.is_empty() {
-        return vec![prefix.to_string()];
-    }
-
-    // Preserve optional closing `#` sequence if present per CommonMark (preceded by horizontal space).
-    let trimmed_end = after.trim_end_matches('#');
-    let closing_hashes = &after[trimmed_end.len()..];
-    if !closing_hashes.is_empty() && (trimmed_end.is_empty() || trimmed_end.ends_with([' ', '\t']))
-    {
-        let body = collapse_inline_spaces(trimmed_end);
-        if body.is_empty() {
-            vec![format!("{prefix} {closing_hashes}")]
-        } else {
-            vec![format!("{prefix} {body} {closing_hashes}")]
-        }
+    let mut formatted = if after.is_empty() {
+        prefix.to_string()
     } else {
-        let body = collapse_inline_spaces(after);
-        if body.is_empty() {
-            vec![prefix.to_string()]
+        // Preserve optional closing `#` sequence if present per CommonMark (preceded by horizontal space).
+        let trimmed_end = after.trim_end_matches('#');
+        let closing_hashes = &after[trimmed_end.len()..];
+        if !closing_hashes.is_empty()
+            && (trimmed_end.is_empty() || trimmed_end.ends_with([' ', '\t']))
+        {
+            let body = collapse_inline_spaces(trimmed_end);
+            if body.is_empty() {
+                format!("{prefix} {closing_hashes}")
+            } else {
+                format!("{prefix} {body} {closing_hashes}")
+            }
         } else {
-            vec![format!("{prefix} {body}")]
+            let body = collapse_inline_spaces(after);
+            if body.is_empty() {
+                prefix.to_string()
+            } else {
+                format!("{prefix} {body}")
+            }
         }
+    };
+    if root_commit_prefix
+        .is_some_and(|prefix| preprocess::is_commit_comment_line(&formatted, prefix))
+    {
+        formatted.insert(0, ' ');
     }
+    vec![formatted]
 }
 
 /// Normalize prose spacing while keeping code, link destinations/titles, and HTML attributes.
 fn collapse_inline_spaces(s: &str) -> String {
-    inline::tokenize_paragraph(s, crate::options::WrapMode::Never, false)
-        .iter()
-        .flat_map(|segment| segment.tokens.iter().map(|token| token.text.as_str()))
-        .collect::<Vec<_>>()
-        .join(" ")
+    inline::tokenize_paragraph(
+        s,
+        crate::options::WrapMode::Never,
+        false,
+        None,
+        inline::CommitLevel::Nested,
+    )
+    .iter()
+    .flat_map(|segment| segment.tokens.iter().map(|token| token.text.as_str()))
+    .collect::<Vec<_>>()
+    .join(" ")
 }
 
 fn strip_blockquote_prefix(line: &str, tab_width: usize) -> String {
@@ -1361,11 +1855,13 @@ fn format_blockquote_lines(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn format_list_lines(
     chunk: &str,
     list_range: Range<usize>,
     item_ranges: &[Range<usize>],
     width: usize,
+    is_root: bool,
     is_markdeep: bool,
     options: &FormattingOptions,
     preserve_layout: bool,
@@ -1399,7 +1895,7 @@ fn format_list_lines(
                 })
             }));
     let numbering = ordered_list_numbering(chunk, &clean_spans, options);
-    let mut out_lines: Vec<String> = Vec::new();
+    let mut out_lines: Vec<String> = Vec::with_capacity(clean_spans.len());
     for (idx, span) in clean_spans.iter().enumerate() {
         let raw_item = &chunk[span.start..span.end];
         let marker_override = numbering.as_ref().and_then(|n| n.marker_for(idx));
@@ -1407,6 +1903,7 @@ fn format_list_lines(
             raw_item,
             marker_override,
             width,
+            is_root,
             is_markdeep,
             options,
             preserve_layout,
@@ -1484,6 +1981,7 @@ fn format_single_list_item(
     raw_item: &str,
     marker_override: Option<String>,
     width: usize,
+    is_root: bool,
     is_markdeep: bool,
     options: &FormattingOptions,
     preserve_layout: bool,
@@ -1542,8 +2040,6 @@ fn format_single_list_item(
     }
 
     let (task_prefix, after_task) = extract_task_checkbox(&rem0);
-    let first_prefix = format!("{marker_prefix}{task_prefix}");
-
     let mut body_lines: Vec<String> = Vec::with_capacity(raw_lines.len());
     body_lines.push(after_task.to_string());
     for (&cont, &lazy) in raw_lines[1..].iter().zip(&lazy_lines) {
@@ -1559,37 +2055,51 @@ fn format_single_list_item(
             body_lines.push(dedent_columns(cont, strip_cols, TAB_STOP));
         }
     }
-
     let body = body_lines.join("\n");
-    if body.trim().is_empty() {
-        // Whether whitespace follows an otherwise empty checkbox has decided between a task item
-        // (`- [ ] `) and literal text (`- [ ]`) in some renderers, so keep what the source had.
-        let source_spaced = rem0.len() > rem0.trim_end_matches([' ', '\t']).len();
-        return vec![if task_prefix.is_empty() || !source_spaced {
-            first_prefix.trim_end().to_string()
-        } else {
-            first_prefix
-        }];
-    }
+    let source_spaced = rem0.len() > rem0.trim_end_matches([' ', '\t']).len();
+    let render_with_marker = |marker_prefix: &str| {
+        let first_prefix = format!("{marker_prefix}{task_prefix}");
+        if body.trim().is_empty() {
+            // Whether whitespace follows an otherwise empty checkbox has decided between a task item
+            // (`- [ ] `) and literal text (`- [ ]`) in some renderers, so keep what the source had.
+            return vec![if task_prefix.is_empty() || !source_spaced {
+                first_prefix.trim_end().to_string()
+            } else {
+                first_prefix
+            }];
+        }
 
-    let mut lines = format_prefixed_container(
-        &body,
-        &first_prefix,
-        ContainerIndent::for_marker(options, marker_prefix.len()),
-        width,
-        is_markdeep,
-        options,
-    );
-    if !task_prefix.is_empty() && after_task.is_empty() && lines.len() > 1 {
-        // A checkbox alone on the marker line needs its trailing whitespace for task
-        // recognition. Also retain any blank line separating it from the next block.
-        let source_spaced = rem0.len() > rem0.trim_end_matches([' ', '\t']).len();
-        if source_spaced {
-            lines[0] = first_prefix;
+        let mut lines = format_prefixed_container(
+            &body,
+            &first_prefix,
+            ContainerIndent::for_marker(options, marker_prefix.len()),
+            width,
+            is_root,
+            is_markdeep,
+            options,
+        );
+        if !task_prefix.is_empty() && after_task.is_empty() && lines.len() > 1 {
+            // A checkbox alone on the marker line needs its trailing whitespace for task
+            // recognition. Also retain any blank line separating it from the next block.
+            if source_spaced {
+                lines[0] = first_prefix;
+            }
+            if raw_lines.get(1).is_some_and(|line| line.trim().is_empty()) && !lines[1].is_empty() {
+                lines.insert(1, String::new());
+            }
         }
-        if raw_lines.get(1).is_some_and(|line| line.trim().is_empty()) && !lines[1].is_empty() {
-            lines.insert(1, String::new());
-        }
+        lines
+    };
+
+    let lines = render_with_marker(&marker_prefix);
+    if is_root
+        && options.commit_message
+        && !preserve_layout
+        && lines
+            .first()
+            .is_some_and(|l| preprocess::is_commit_comment_line(l, &options.comment_char))
+    {
+        return render_with_marker(&format!(" {marker} "));
     }
     lines
 }
@@ -1781,7 +2291,15 @@ fn format_footnote_lines(
         block: 4,
         content: 4,
     };
-    format_prefixed_container(&body, &first_prefix, indent, width, is_markdeep, options)
+    format_prefixed_container(
+        &body,
+        &first_prefix,
+        indent,
+        width,
+        false,
+        is_markdeep,
+        options,
+    )
 }
 
 fn format_prefixed_container(
@@ -1789,6 +2307,7 @@ fn format_prefixed_container(
     first_prefix: &str,
     indent: ContainerIndent,
     width: usize,
+    is_root: bool,
     is_markdeep: bool,
     options: &FormattingOptions,
 ) -> Vec<String> {
@@ -1816,6 +2335,7 @@ fn format_prefixed_container(
             first_width: width.saturating_sub(first_prefix.len()).max(1),
             rest_indent: indent.para,
             rest_width: width.saturating_sub(indent.para).max(1),
+            root_continuations: is_root && indent.para == 0,
         };
         let units = format_block_units(
             body,

@@ -53,12 +53,43 @@ const CASES: &[&str] = &[
     "<pre>\n<rules>\na   b\n</rules>\n</pre>\n",
     "```\ncode\n\n\n",
     "**Title**\n    Author\n\nTerm\n:   Long definition body that can wrap.\n\n<script src=\"markdeep.min.js\"></script>\n",
+    "---\ntitle: Fix <code> tag\n---\n\nText   here.\n",
+    "<rules>\nText here\n$$x$$\n</rules>\n",
     "Text with trailing blank lines.\n\n\n",
+];
+
+const COMMIT_CASES: &[&str] = &[
+    "S\n  # h\ndiff -u\n  > q\nSigned-off-by: A\nJJ: ignore-rest\n+x\n\n",
+    "Subject\n\n<rules>\n\nJJ: note\n",
+    "Subject\n\n- heading\n  ===\n",
+    "Subject\n\n> heading\n> ===\n",
+    "Subject\n\n| a | b |\n| - | - |\n| 1 | 2 |\n",
+    "Subject   kept   verbatim   even   when   longer   than   thirty   cols\n\nBody   paragraph   that   wraps   around   thirty   columns.\n\nBug: 123\nChange-Id: I0123456789abcdef0123456789abcdef01234567\n# Please enter the commit message\n#\tmodified:   src/lib.rs\n",
+    "Subject\n\nBody   text.\n\nChange-Id: I0123456789abcdef0123456789abcdef01234567\n# ------------------------ >8 ------------------------\ndiff --git a/x b/x\n--- a/x\n+++ b/x\n",
+    "\n# Please enter the commit message\n# On branch main\n",
+    "Fix   thing\n\nJJ: This commit contains:\n\nJJ: hint\nJJ: ignore-rest\ndiff --git a/x b/x\n",
+    "Subject\n\n- parent\n#comment\n  - child   item\n",
+    "Subject\n\nBody   text.\n\nCustom: value\n---\nnotes   here\n",
+    "Subject\n\nfoo `one   two\n#end` tail\n",
+    "Subject\n\n```\ncode\n```\n-----BEGIN PGP SIGNATURE-----\niQEz\n-----END PGP SIGNATURE-----\n    continuation\nfollowing text\n",
+    "Subject\n\n  # Indented heading\n\n  ---\n\nBug: 123\n",
+    "Subject\n\n- item\n<rules>\n  ---\n</rules>\n",
+    "Fix <code> tag\n\nBody   text.\n",
+    "Subject\n\nCustom: value\n\nConflicts:\n\tfoo.md\n",
+    "Subject\n\n<rules>\n-   item\n\n    second paragraph\nConflicts:\n\tfile\n",
+    "\nJJ: note\n\tcode\nOther: value\n",
+    "\n---\nk: v\n#c\n---\nend\n",
 ];
 
 fn opts() -> FormattingOptions {
     let mut opts = FormattingOptions::default();
     opts.max_line_width = 30;
+    opts
+}
+
+fn commit_opts() -> FormattingOptions {
+    let mut opts = opts();
+    opts.commit_message = true;
     opts
 }
 
@@ -74,54 +105,60 @@ fn without_final_newline(s: &str) -> &str {
 
 #[test]
 fn crlf_files_format_like_lf_files() {
-    for case in CASES {
-        let expected = crlf(&format_markdown(case, &opts()));
-        let actual = format_markdown(&crlf(case), &opts());
-        assert_eq!(actual, expected, "input: {case:?}");
-        assert!(
-            !actual.replace("\r\n", "").contains('\n'),
-            "bare LF in {actual:?}"
-        );
-        assert_eq!(format_markdown(&actual, &opts()), actual, "not idempotent");
+    for (cases, options) in [(CASES, opts()), (COMMIT_CASES, commit_opts())] {
+        for case in cases {
+            let expected = crlf(&format_markdown(case, &options));
+            let actual = format_markdown(&crlf(case), &options);
+            assert_eq!(actual, expected, "input: {case:?}");
+            assert!(
+                !actual.replace("\r\n", "").contains('\n'),
+                "bare LF in {actual:?}"
+            );
+            assert_eq!(format_markdown(&actual, &options), actual, "not idempotent");
+        }
     }
 }
 
 #[test]
 fn missing_final_newline_is_preserved() {
-    for case in CASES {
-        for input in [case.to_string(), crlf(case)] {
-            let input_without = without_final_newline(without_final_newline(&input).trim_end());
-            // A one-line file has no line endings left to detect, so new ones default to LF.
-            let source = if input_without.contains('\n') {
-                format!(
-                    "{input_without}{}",
-                    if input.contains("\r\n") { "\r\n" } else { "\n" }
-                )
-            } else {
-                format!("{input_without}\n")
-            };
-            let expected = format_markdown(&source, &opts());
-            let actual = format_markdown(input_without, &opts());
-            assert_eq!(
-                actual,
-                without_final_newline(&expected),
-                "input: {input_without:?}"
-            );
-            assert_eq!(format_markdown(&actual, &opts()), actual, "not idempotent");
+    for (cases, options) in [(CASES, opts()), (COMMIT_CASES, commit_opts())] {
+        for case in cases {
+            for input in [case.to_string(), crlf(case)] {
+                let input_without = without_final_newline(without_final_newline(&input).trim_end());
+                // A one-line file has no line endings left to detect, so new ones default to LF.
+                let source = if input_without.contains('\n') {
+                    format!(
+                        "{input_without}{}",
+                        if input.contains("\r\n") { "\r\n" } else { "\n" }
+                    )
+                } else {
+                    format!("{input_without}\n")
+                };
+                let expected = format_markdown(&source, &options);
+                let actual = format_markdown(input_without, &options);
+                assert_eq!(
+                    actual,
+                    without_final_newline(&expected),
+                    "input: {input_without:?}"
+                );
+                assert_eq!(format_markdown(&actual, &options), actual, "not idempotent");
+            }
         }
     }
 }
 
 #[test]
 fn byte_order_mark_is_preserved_and_ignored_for_formatting() {
-    for case in CASES {
-        for input in [case.to_string(), crlf(case)] {
-            let expected = format!("\u{feff}{}", format_markdown(&input, &opts()));
-            assert_eq!(
-                format_markdown(&format!("\u{feff}{input}"), &opts()),
-                expected,
-                "input: {input:?}"
-            );
+    for (cases, options) in [(CASES, opts()), (COMMIT_CASES, commit_opts())] {
+        for case in cases {
+            for input in [case.to_string(), crlf(case)] {
+                let expected = format!("\u{feff}{}", format_markdown(&input, &options));
+                assert_eq!(
+                    format_markdown(&format!("\u{feff}{input}"), &options),
+                    expected,
+                    "input: {input:?}"
+                );
+            }
         }
     }
     // Front matter after a BOM is still recognized (and so left alone).

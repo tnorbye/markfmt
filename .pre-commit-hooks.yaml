@@ -30,3 +30,11 @@
   language: rust
   types: [text]
   files: '(?i)(\.(md|markdown|mdown|mkd|mkdn|mdwn|md\.html)$|(^|/)(README|CHANGELOG|CONTRIBUTING|HACKING|SECURITY|PULL_REQUEST_TEMPLATE|RELEASE_NOTES|NEWS)$)'
+
+- id: markfmt-commit-msg
+  name: markfmt (commit-msg)
+  description: Format Git commit messages while preserving trailers and comments.
+  entry: markfmt --commit-msg
+  language: rust
+  stages: [commit-msg]
+  always_run: true

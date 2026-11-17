@@ -2,7 +2,7 @@
 
 A fast, standalone formatter for Markdown, Markdeep, and AI agent
 instruction and skill files (`AGENTS.md`, `GEMINI.md`, `CLAUDE.md`,
-`SKILL.md`, ...).
+`SKILL.md`, ...). It also formats Git and Jujutsu commit messages.
 
 `markfmt` reflows paragraphs to a consistent width, aligns
 tables, and tidies lists and headings, while keeping your Markdown
@@ -230,6 +230,9 @@ Files ending in `.md.html` or containing `markdeep.min.js` /
   colored, word-highlighted diffs on terminals.
 - **Configuration** from `.editorconfig` and `.markfmt.toml`, plus
   [inline ignore directives](#inline-ignore-directives).
+- **[Commit messages](#commit-messages---commit-msg)**: reflows the body
+  while keeping the subject, trailers, and comment lines intact, as a
+  filter or by wrapping your editor (`--commit-editor`).
 - **[pre-commit](#pre-commit) hooks**, stdin/stdout mode for editors,
   and parallel formatting of large repositories.
 
@@ -331,8 +334,8 @@ markfmt --lines 10:25 README.md
 ### Editors and Scripts (stdin)
 
 Format via stdin/stdout, with an optional virtual path for
-`.editorconfig`, `.markfmt.toml`, and `.md.html` detection. Only the
-formatted document is printed, never a summary:
+`.editorconfig`, `.markfmt.toml`, Markdeep, and commit-message
+detection. Only the formatted document is printed, never a summary:
 
 ```sh
 cat guide.md | markfmt --stdin-filepath docs/guide.md -
@@ -340,6 +343,64 @@ cat guide.md | markfmt --stdin-filepath docs/guide.md -
 
 You can also pass `@<filename>` to read newline-separated arguments and
 paths from a file.
+
+### Commit Messages (`--commit-msg`)
+
+Format Git and Jujutsu commit messages while keeping commit
+metadata intact. Commit mode is enabled with `--commit-msg` (alias
+`--commit-message`) or automatically for `COMMIT_EDITMSG`, `MERGE_MSG`,
+`SQUASH_MSG`, `TAG_EDITMSG`, `NOTES_EDITMSG`, `EDIT_DESCRIPTION`, and
+`*.jjdescription`:
+
+- Keeps a single-line opening subject verbatim (preserving `fixup!`,
+  `squash!`, `Revert "..."`, and bullet/numbered prefixes).
+- Preserves Git and Gerrit trailer blocks (`Change-Id:`,
+  `Signed-off-by:`, `Co-authored-by:`, `Bug:`, `Test:`, multi-line
+  `Relnote:`, `(cherry picked from commit ...)`) and warns when
+  a trailer is missing a separating blank line. Like Git, it
+  looks for trailers above a `---` patch divider and honors
+  the `trailer.separators` (or `--trailer-separators`) and
+  `trailer.<name>.key` Git settings.
+- Leaves comment lines (`#`, `git config core.commentString` /
+  `core.commentChar` including `auto`, `--comment-char`, and Jujutsu
+  `JJ:`), `git commit -v` / `JJ: ignore-rest` scissors diffs, and PGP
+  signatures untouched. A paragraph, list, or quote that a comment line
+  touches without a blank line in between is left as written, since Git
+  strips the comment and joins what remains.
+- Never wraps comment prefixes (`#123`), `git am` patch breaks
+  (`diff -...`, `Index:`), or `Token:` prefixes to column 0.
+
+```sh
+# Wrap your interactive editor (`$MARKFMT_EDITOR`, `$VISUAL`, or `$EDITOR`)
+# so saved commit messages are formatted before hooks (such as Gerrit's
+# commit-msg hook) run, while rebase todos and patches pass through:
+git config --global core.editor "markfmt --commit-editor"
+
+# Vim / Neovim gitcommit filter. Format the whole message (`gggqG`):
+# markfmt can't tell a lone line from a subject, so it keeps it verbatim.
+autocmd FileType gitcommit setlocal formatprg=markfmt\ --commit-msg\ -
+
+# Reformat the most recent commit message in place:
+GIT_EDITOR=markfmt git commit --amend
+```
+
+The body is read as Markdown, so lines are joined the way CommonMark
+joins them. An indented log or stack trace is kept as written only
+when a blank line separates it from the text above (or it is fenced
+with ` ``` `); right after a text line, indented lines continue that
+paragraph and are reflowed into it, and so are unindented lines after a
+list item. For example:
+
+```text
+The crash:
+    at Foo.bar(Foo.java:12)
+```
+
+becomes `The crash: at Foo.bar(Foo.java:12)`. Put a blank line
+before the trace, fence it, or, if your commit bodies often hold logs
+like this, pass `--wrap preserve` (or set `wrap = "preserve"` under
+`[commit_message]` in `.markfmt.toml`) to normalize spacing without
+joining lines.
 
 ### pre-commit
 
@@ -352,6 +413,7 @@ repos:
     rev: v1.0.0
     hooks:
       - id: markfmt # or markfmt-check to only verify
+      - id: markfmt-commit-msg # optional: format commit messages (stages: [commit-msg])
 ```
 
 pre-commit builds the hook with `cargo install`, so Rust must be
@@ -405,6 +467,14 @@ ordered_lists = "ascending" # preserve | ascending | one
 
 # Files to skip, relative to this file's directory:
 exclude = ["CHANGELOG.md", "vendor/", "docs/generated/**"]
+
+# Optional commit-message settings (top-level settings and excludes do not
+# apply to commit messages):
+[commit_message]
+max_line_width = 72
+wrap = "always"    # use "preserve" to keep line breaks in pasted logs
+comment_char = "#" # "#", ";", "//", or "auto"
+trailer_separators = ":" # default: `git config trailer.separators`, else ":"
 ```
 
 Exclude patterns work like `.gitignore`: a pattern without `/` matches a
@@ -479,6 +549,10 @@ of the file unformatted.
 | `--explain`                     | Explain included and skipped inputs without modifying files                  |
 | `--wrap <MODE>`                 | `always` (default), `never`, `preserve`, or `sentence`                       |
 | `--ordered-lists <STYLE>`       | `preserve` (default), `ascending`, or `one`                                  |
+| `--commit-msg`                  | Format as a Git or Jujutsu commit message (alias `--commit-message`)         |
+| `--commit-editor[=<CMD>]`       | Edit with `<CMD>` (`$MARKFMT_EDITOR`/`$VISUAL`/`$EDITOR`), then format       |
+| `--comment-char <CHAR>`         | Commit comment prefix (`#`, `;`, `//`, or `auto`; reads `git config`)        |
+| `--trailer-separators <CHARS>`  | Commit trailer separators (default from `git config trailer.separators`)     |
 | `--config <PATH>`               | Use this config file instead of searching for `.markfmt.toml`                |
 | `--no-config`                   | Do not read `.markfmt.toml` files                                            |
 | `--exclude <PATTERN>`           | Skip matching files (relative to the current directory; repeatable)          |
@@ -488,7 +562,7 @@ of the file unformatted.
 | `--overlaps-git-changes <MODE>` | Only format blocks overlapping `uncommitted`, `staged`, or `HEAD` changes    |
 | `--git-path <PATH>`             | Explicit path to the `git` executable                                        |
 | `--lines <RANGE>`               | Only format blocks overlapping 1-based line range(s) on a single file        |
-| `--stdin-filepath <PATH>`       | Virtual path for configuration and Markdeep detection when reading `-`       |
+| `--stdin-filepath <PATH>`       | Virtual path for config, Markdeep, and commit detection when reading `-`     |
 | `-n`, `--dry-run`               | Print paths of files that would change without modifying them                |
 | `--check`                       | Verify formatting without modifying files; exit `1` if changes are needed    |
 | `--diff`                        | Print a unified diff of formatting changes without modifying files           |
@@ -511,6 +585,11 @@ of the file unformatted.
 
 Files that cannot be read or written are reported and skipped; the
 remaining files are still processed, and the run exits with `2`.
+
+With `--commit-editor`, a nonzero exit code from the underlying editor
+is passed through. After the editor succeeds, formatting errors are
+warnings: the affected message stays as edited, and markfmt exits with
+`0` so Git can continue the commit.
 
 ## Installation
 

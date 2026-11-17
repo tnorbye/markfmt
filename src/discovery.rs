@@ -38,6 +38,15 @@ const SKIP_BASENAME_PREFIXES: &[&str] = &["LICENSE", "COPYING", "NOTICE", "PATEN
 
 const VCS_DIRS: &[&str] = &[".git", ".hg", ".svn"];
 
+const COMMIT_MESSAGE_NAMES: &[&str] = &[
+    "COMMIT_EDITMSG",
+    "MERGE_MSG",
+    "SQUASH_MSG",
+    "TAG_EDITMSG",
+    "NOTES_EDITMSG",
+    "EDIT_DESCRIPTION",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputTarget {
     Stdin,
@@ -269,6 +278,22 @@ pub fn is_markdeep_path(path: &Path) -> bool {
         .and_then(|n| n.to_str())
         .map(|n| n.to_ascii_lowercase().ends_with(".md.html"))
         .unwrap_or(false)
+}
+
+/// Whether `path` is a known Git or Jujutsu commit/tag/note/description edit file.
+pub fn is_commit_message_path(path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    if COMMIT_MESSAGE_NAMES
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(file_name))
+    {
+        return true;
+    }
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("jjdescription"))
 }
 
 fn is_eligible_walked_file(path: &Path) -> bool {
