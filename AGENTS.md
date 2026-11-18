@@ -25,8 +25,9 @@ See [README.md](README.md) for user-facing behavior.
 Run `make check` and make sure it passes. It runs `cargo doc`
 (warnings are errors), `cargo fmt --check`, `markfmt --check .` on this
 repository's own Markdown, `cargo clippy --all-targets -D warnings`,
-and `cargo test`. If you edited Markdown, run `make fmt` (or
-`cargo run -- .`) to format it with the tool itself.
+`typos` and `cargo deny` (spelling and dependency advisories; each
+skipped if not installed), and `cargo test`. If you edited Markdown, run
+`make fmt` (or `cargo run -- .`) to format it with the tool itself.
 
 ## Invariants
 
@@ -117,6 +118,16 @@ break before them.
   the CI `licenses` job enforces this. Don't add a license there without
   checking it is compatible with Apache-2.0 and with distributing
   binaries.
+- If `cargo deny` reports a RustSec advisory, update or replace
+  the affected crate. Add an `ignore` entry with a reason to
+  [deny.toml](deny.toml) only when no fixed version exists and the
+  advisory doesn't affect `markfmt`.
+- The crate forbids `unsafe` code (`[lints.rust]` in
+  [Cargo.toml](Cargo.toml)).
+- Deliberate misspellings (test fixtures, escaped strings) go in
+  [_typos.toml](_typos.toml) with a comment saying why.
+- The release workflow runs `cargo semver-checks` against the latest
+  crates.io release; bump the major version for a breaking API change.
 - GitHub Actions are pinned to commit SHAs with a version comment;
   Dependabot updates them. Don't replace a pin with a movable tag.
 - Releases come from pushing a `vX.Y.Z` tag that matches `version`

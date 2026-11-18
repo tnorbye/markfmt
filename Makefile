@@ -23,11 +23,14 @@ PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
 MANDIR ?= $(PREFIX)/share/man
 CARGO_ABOUT ?= cargo about
+CARGO_DENY ?= cargo deny
+CARGO_DENY_FLAGS ?=
+TYPOS ?= typos
 LICENSES_FILE := target/THIRD-PARTY-LICENSES.txt
 
-.PHONY: check fmt format fmt-check lint test doc build release licenses dist install uninstall clean
+.PHONY: check fmt format fmt-check lint deny spell semver test doc build release licenses dist install uninstall clean
 
-check: fmt-check lint test doc
+check: fmt-check lint spell deny test doc
 
 fmt:
 	$(CARGO) fmt --all
@@ -41,6 +44,38 @@ fmt-check:
 
 lint:
 	$(CARGO) clippy $(CARGO_FLAGS) --all-targets -- -D warnings
+
+# Spelling mistakes in source, tests, and docs (deliberate misspellings are listed in
+# _typos.toml). Skipped with a warning when typos isn't installed; CI always runs it. Install with:
+#   cargo install --locked typos-cli
+spell:
+	@if $(TYPOS) --version >/dev/null 2>&1; then \
+		$(TYPOS); \
+	else \
+		echo "warning: typos is not installed; skipping spell check" >&2; \
+		echo "         (cargo install --locked typos-cli)" >&2; \
+	fi
+
+# Breaking public API changes since the latest crates.io release. The release workflow runs it
+# before publishing. Requires cargo-semver-checks:
+#   cargo install --locked cargo-semver-checks
+semver:
+	$(CARGO) semver-checks
+
+# Known vulnerabilities, unmaintained or yanked crates, and unexpected sources in Cargo.lock
+# (configured in deny.toml). Fetches the RustSec advisory database into
+# $CARGO_HOME/advisory-dbs (~/.cargo by default), so it needs the network and a writable cache
+# there (set CARGO_HOME to move it); a fetch or cache failure fails the check. CARGO_DENY_FLAGS
+# adds global flags, such as `make deny CARGO_DENY_FLAGS=--offline` to use a fetched database.
+# Skipped with a warning when cargo-deny isn't installed; CI always runs it. Install with:
+#   cargo install --locked cargo-deny
+deny:
+	@if $(CARGO_DENY) --version >/dev/null 2>&1; then \
+		$(CARGO_DENY) --locked --all-features $(CARGO_DENY_FLAGS) check advisories bans sources; \
+	else \
+		echo "warning: cargo-deny is not installed; skipping dependency checks" >&2; \
+		echo "         (cargo install --locked cargo-deny)" >&2; \
+	fi
 
 test:
 	$(CARGO) test $(CARGO_FLAGS)

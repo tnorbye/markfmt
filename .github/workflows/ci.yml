@@ -55,6 +55,10 @@ jobs:
       - name: Check Markdown formatting
         run: cargo run --locked -- --check .
 
+      # Deliberate misspellings are listed in _typos.toml.
+      - name: Check spelling
+        uses: crate-ci/typos@276087d9a4f06398b3e04825487805e2d7375888 # v1.52.2
+
       - name: Build API docs
         run: cargo doc --locked --no-deps
         env:

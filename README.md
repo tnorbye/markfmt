@@ -784,8 +784,11 @@ Gradle-style targets:
 | Verify formatting    | `make fmt-check` | `cargo fmt --all -- --check && cargo run -- --check .`   |
 | Lint                 | `make lint`      | `cargo clippy --all-targets -- -D warnings`              |
 | Run tests            | `make test`      | `cargo test`                                             |
+| Check spelling       | `make spell`     | `typos` (exceptions in `_typos.toml`)                    |
+| Audit dependencies   | `make deny`      | `cargo deny check advisories bans sources`               |
+| Check API semver     | `make semver`    | `cargo semver-checks` (against crates.io release)        |
 | Build API docs       | `make doc`       | `cargo doc --no-deps` (warnings are errors)              |
-| Full check (`check`) | `make check`     | Runs `fmt-check`, `lint`, `test`, and `doc`              |
+| Full check (`check`) | `make check`     | Runs `fmt-check`, `lint`, `spell`, `deny`, `test`, `doc` |
 | Build release binary | `make release`   | `cargo build --release`                                  |
 | License notices      | `make licenses`  | `cargo about generate` (see [Licenses](#license))        |
 | Package distribution | `make dist`      | Builds release archive in `target/dist/`                 |
@@ -889,6 +892,17 @@ compiled into the binary, generated from `Cargo.lock` by
 (`make licenses`). The accepted licenses are listed in
 [about.toml](about.toml), and CI fails if a dependency isn't available
 under one of them.
+
+[cargo-deny](https://github.com/EmbarkStudios/cargo-deny) (`make deny`,
+configured in [deny.toml](deny.toml)) checks `Cargo.lock` against the
+[RustSec](https://rustsec.org/) advisory database and rejects yanked
+crates and crates from outside crates.io. CI runs it on every change
+and weekly, so newly published advisories show up without a code change.
+`make check` skips it with a warning if cargo-deny isn't installed
+(`cargo install --locked cargo-deny`). It fetches the database into
+`$CARGO_HOME/advisory-dbs`; pass `CARGO_DENY_FLAGS=--offline` to audit
+against an already fetched copy (a missing or unreadable database still
+fails the check).
 
 See [kdoc-formatter](https://github.com/tnorbye/kdoc-formatter) for the
 original Kotlin/KDoc formatter that inspired this project.
