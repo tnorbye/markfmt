@@ -652,7 +652,11 @@ fn cli_auto_detection_config_isolation_comment_char_and_git_amend() {
     ]);
     let amend = Command::new("git")
         .current_dir(project.path())
-        .env("GIT_EDITOR", env!("CARGO_BIN_EXE_markfmt"))
+        // Git runs the editor through `sh`, so quote the path to keep Windows backslashes.
+        .env(
+            "GIT_EDITOR",
+            format!("\"{}\"", env!("CARGO_BIN_EXE_markfmt")),
+        )
         .args([
             "-c",
             "commit.gpgsign=false",
