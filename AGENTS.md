@@ -116,6 +116,8 @@ handling.
   it under the new option's values).
 - Keep the README's options table and exit codes in sync with
   [src/cli.rs](src/cli.rs) and [src/main.rs](src/main.rs).
+- Add user-visible changes (new options, changed behavior, fixes) under
+  `[Unreleased]` in [CHANGELOG.md](CHANGELOG.md).
 - `rust-version` in [Cargo.toml](Cargo.toml) and the `msrv` job in
   [.github/workflows/ci.yml](.github/workflows/ci.yml) must match. Raise
   both if a dependency update requires a newer Rust.

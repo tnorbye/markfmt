@@ -855,10 +855,13 @@ To bump the version and publish a new release to GitHub and crates.io:
 
 1. Update `version = "X.Y.Z"` under `[package]` in
    [Cargo.toml](Cargo.toml).
-2. Run `make check` to update `Cargo.lock` and verify formatting, lints,
+2. In [CHANGELOG.md](CHANGELOG.md), rename `[Unreleased]` to
+   `[X.Y.Z] - <date>`, add a new empty `[Unreleased]` section, and
+   update the comparison links at the bottom.
+3. Run `make check` to update `Cargo.lock` and verify formatting, lints,
    and tests.
-3. Commit the changes (`git commit -am "Bump version to X.Y.Z"`).
-4. Create and push a matching `v`-prefixed tag:
+4. Commit the changes (`git commit -am "Bump version to X.Y.Z"`).
+5. Create and push a matching `v`-prefixed tag:
 
 ```sh
 git tag vX.Y.Z
