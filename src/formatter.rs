@@ -146,7 +146,98 @@ pub fn format_markdown(input: &str, options: &FormattingOptions) -> String {
 /// Formats `input`, the contents of the file at `canonical_path`. If `range_filter` selects line
 /// ranges, only the top-level blocks overlapping them are reformatted and everything else is
 /// kept byte-for-byte.
+///
+/// A commit message comes back unchanged if formatting it would do more than change whitespace,
+/// change the trailers Git parses, or give a result that formats differently a second time.
 pub fn format_file_content(
+    input: &str,
+    canonical_path: &Path,
+    range_filter: &RangeFilter,
+    options: &FormattingOptions,
+) -> String {
+    let out = format_file_content_unchecked(input, canonical_path, range_filter, options);
+    if !options.commit_message || out == input {
+        return out;
+    }
+    // Partial formatting is safe only if formatting the whole message is.
+    if range_filter.is_filtered() {
+        let whole =
+            format_file_content_unchecked(input, canonical_path, &RangeFilter::All, options);
+        if !commit_format_is_safe(input, &whole, options, true) {
+            return input.to_string();
+        }
+    }
+    // Reformatting partial output would also format the lines outside the range, and the
+    // range's line numbers no longer match after reflow, so idempotence is checked above on
+    // the whole message instead.
+    if commit_format_is_safe(input, &out, options, !range_filter.is_filtered()) {
+        out
+    } else {
+        input.to_string()
+    }
+}
+
+/// Whether `formatted` (fully formatted from `input`) keeps a commit message's meaning: the same
+/// words in the same order, the same trailers as Git parses them, the same rendered structure,
+/// and no further change when formatted again. Commit messages are read as plain text, so these hold them to more than
+/// Markdown rendering does; this check is the backstop for cases the formatter misses.
+fn commit_format_is_safe(
+    input: &str,
+    formatted: &str,
+    options: &FormattingOptions,
+    check_idempotence: bool,
+) -> bool {
+    let normalize = |text: &str| {
+        text.strip_prefix('\u{feff}')
+            .unwrap_or(text)
+            .replace("\r\n", "\n")
+    };
+    // The byte order mark is not whitespace, so compare words only after removing it.
+    let (before, after) = (normalize(input), normalize(formatted));
+    // Renumbering ordered lists is the one non-whitespace change asked for explicitly.
+    let renumbers = options.ordered_lists != OrderedListStyle::Preserve;
+    let is_list_number = |word: &str| {
+        word.strip_suffix(['.', ')'])
+            .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let same_word =
+        |a: &str, b: &str| a == b || (renumbers && is_list_number(a) && is_list_number(b));
+    let (mut words_before, mut words_after) = (before.split_whitespace(), after.split_whitespace());
+    loop {
+        match (words_before.next(), words_after.next()) {
+            (None, None) => break,
+            (Some(a), Some(b)) if same_word(a, b) => {}
+            _ => return false,
+        }
+    }
+    let comment_prefix = preprocess::resolve_comment_prefix(&before, &options.comment_char);
+    let commit = preprocess::CommitSyntax {
+        comment_prefix,
+        trailer_separators: &options.trailer_separators,
+        trailer_keys: &options.trailer_keys,
+    };
+    if git_trailer_lines(&before, commit) != git_trailer_lines(&after, commit) {
+        return false;
+    }
+    // The words already match, so comparing the rendered HTML apart from whitespace catches
+    // structural changes (a new thematic break, a quote nested into a list, a lost hard break).
+    let render = |text: &str| {
+        let mut html = String::new();
+        pulldown_cmark::html::push_html(&mut html, Parser::new_ext(text, parser_options()));
+        html
+    };
+    if !render(&before)
+        .split_whitespace()
+        .eq(render(&after).split_whitespace())
+    {
+        return false;
+    }
+    !check_idempotence
+        || format_file_content_unchecked(formatted, Path::new(""), &RangeFilter::All, options)
+            == formatted
+}
+
+fn format_file_content_unchecked(
     input: &str,
     canonical_path: &Path,
     range_filter: &RangeFilter,
@@ -160,7 +251,7 @@ pub fn format_file_content(
     // format the text after it and put it back.
     if let Some(body) = input.strip_prefix('\u{feff}') {
         let mut out = String::from('\u{feff}');
-        out.push_str(&format_file_content(
+        out.push_str(&format_file_content_unchecked(
             body,
             canonical_path,
             range_filter,
@@ -1400,7 +1491,26 @@ fn format_top_ast_item(
             BlockUnit::new(lines, start_line, end_line)
         }
         TopAstItem::BlockQuote { is_alert, .. } => {
-            let lines = format_blockquote_lines(raw_slice, *is_alert, width, is_markdeep, options);
+            // In a commit message, which is read as plain text, reflowing a quote adds or drops
+            // `>` markers (lazy continuation lines join the quote), so quotes stay as written.
+            let lines = if options.commit_message {
+                // Drop only the quote's own indentation (at most 3 spaces), which can move it into
+                // a preceding list once that list's markers are normalized.
+                let lines = raw_lines_verbatim(raw_slice);
+                let indent = lines
+                    .first()
+                    .map_or(0, |line| line.len() - line.trim_start_matches(' ').len())
+                    .min(3);
+                lines
+                    .into_iter()
+                    .map(|line| {
+                        let spaces = line.len() - line.trim_start_matches(' ').len();
+                        line[spaces.min(indent)..].to_string()
+                    })
+                    .collect()
+            } else {
+                format_blockquote_lines(raw_slice, *is_alert, width, is_markdeep, options)
+            };
             BlockUnit::new(lines, start_line, end_line)
         }
         TopAstItem::List {

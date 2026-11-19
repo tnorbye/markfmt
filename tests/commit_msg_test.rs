@@ -14,10 +14,13 @@
 
 use std::fs;
 use std::io::Write;
+use std::path::Path;
 use std::process::{Command, Stdio};
 
+use markfmt::formatter::format_file_content;
 use markfmt::lint::lint_with_options;
-use markfmt::{format_markdown, FormattingOptions, WrapMode};
+use markfmt::range_filter::RangeFilter;
+use markfmt::{format_markdown, FormattingOptions, OrderedListStyle, WrapMode};
 use pretty_assertions::assert_eq;
 
 mod common;
@@ -1865,4 +1868,62 @@ fn commit_body_preserves_heading_and_table_syntax() {
             "{input:?}"
         );
     }
+}
+
+#[test]
+fn quotes_stay_as_written_so_lazy_lines_do_not_join_them() {
+    // In Markdown the second line continues the quote; in a commit message it is the author's
+    // explanation, and reflowing would put it inside the quoted error.
+    let input = "Fix crash\n\n> error: foo failed\nThis happens when bar is unset.\n";
+    assert_format(input, input, &commit_opts(72));
+    let input = "Subject\n\n> a quoted line that is long\n> and continues here\n";
+    assert_format(input, input, &commit_opts(20));
+}
+
+#[test]
+fn unsafe_commit_formatting_falls_back_to_the_message_as_written() {
+    // Formatting this once dedents the underline and separates it, which changes the trailers
+    // Git sees, so a second pass would reflow `A` and `B`: the message is kept as it is.
+    let input = "A\nB\nBug: 1\n  ---\nx\n";
+    assert_format(input, input, &commit_opts(72));
+}
+
+#[test]
+fn partial_commit_formatting_passes_the_safety_check_with_other_text_unformatted() {
+    // Reformatting the partial output would also format the second paragraph, so the
+    // idempotence check must not run on it, or the selected paragraph stays unformatted.
+    let path = Path::new("/virtual/COMMIT_EDITMSG");
+    let only_line_3 = RangeFilter::from_line_strings(path, &["3".to_string()]).unwrap();
+    let input =
+        "Subject\n\nFirst   unformatted   paragraph.\n\nSecond   unformatted   paragraph.\n";
+    assert_eq!(
+        format_file_content(input, path, &only_line_3, &commit_opts(72)),
+        "Subject\n\nFirst unformatted paragraph.\n\nSecond   unformatted   paragraph.\n"
+    );
+}
+
+#[test]
+fn renumbering_ordered_lists_passes_the_commit_safety_check() {
+    let input = "Subject\n\n1. First   item\n3. Second   item\n";
+    let mut opts = commit_opts(72);
+    opts.ordered_lists = OrderedListStyle::Ascending;
+    assert_format(input, "Subject\n\n1. First item\n2. Second item\n", &opts);
+    opts.ordered_lists = OrderedListStyle::One;
+    assert_format(input, "Subject\n\n1. First item\n1. Second item\n", &opts);
+    // Without a renumbering option, a changed number would still be refused.
+    assert_format(
+        input,
+        "Subject\n\n1. First item\n3. Second item\n",
+        &commit_opts(72),
+    );
+}
+
+#[test]
+fn byte_order_mark_before_a_blank_line_passes_the_commit_safety_check() {
+    let path = Path::new("/virtual/COMMIT_EDITMSG");
+    let input = "\u{feff}\nSubject\n\nBody   with   spaces.\n";
+    assert_eq!(
+        format_file_content(input, path, &RangeFilter::All, &commit_opts(72)),
+        "\u{feff}Subject\n\nBody with spaces.\n"
+    );
 }

@@ -45,8 +45,11 @@ change must keep both of these true:
   block types to its `CASES` (or `COMMIT_CASES`).
 - **Commit-metadata-preserving** (`commit_message` mode):
   `git stripspace -s` is unchanged apart from reflow whitespace, and
-  `git interpret-trailers --parse` is byte-for-byte identical before and
-  after formatting.
+  `git interpret-trailers --parse` is byte-for-byte identical before
+  and after formatting. `format_file_content` enforces this (and
+  idempotence) at run time by returning a commit message unchanged when
+  a check fails; that is a backstop, so still fix the cause of any case
+  that reaches it.
 
 [tests/roundtrip_test.rs](tests/roundtrip_test.rs) checks both over
 generated paragraphs full of "hazard" words. When you fix a case where
@@ -55,7 +58,10 @@ to `line_start_and_end_hazards_round_trip` there, and if the word can
 appear in prose, add it to `HAZARDS` too. Words that must not start a
 line belong in `can_start_line` in [src/inline.rs](src/inline.rs); the
 tokenizer glues them to the previous word so no wrapping strategy can
-break before them.
+break before them. `random_commit_messages_keep_git_invariants` there
+fuzzes commit messages; run it longer with `MARKFMT_FUZZ_CASES=20000`
+(and another `MARKFMT_FUZZ_SEED`) after changing commit-message
+handling.
 
 ## Code Map
 

@@ -357,10 +357,22 @@ fn run_git_pipe(args: &[&str], input: &str) -> String {
 }
 
 fn check_commit_git_invariants(input: &str, opts: &FormattingOptions) -> Option<String> {
-    if let Some(failure) = check_round_trip(input, opts) {
-        return Some(failure);
-    }
+    check_round_trip(input, opts).or_else(|| check_git_invariants(input, opts, true))
+}
+
+/// Idempotence and the Git invariants; `render_stripped` also compares the rendered
+/// `git stripspace -s` output.
+fn check_git_invariants(
+    input: &str,
+    opts: &FormattingOptions,
+    render_stripped: bool,
+) -> Option<String> {
     let once = markfmt::format_markdown(input, opts);
+    if markfmt::format_markdown(&once, opts) != once {
+        return Some(format!(
+            "not idempotent with {opts:?}\ninput: {input:?}\nonce: {once:?}"
+        ));
+    }
     let comment_cfg = format!("core.commentString={}", opts.comment_char);
     let separators_cfg = format!("trailer.separators={}", opts.trailer_separators);
 
@@ -368,7 +380,8 @@ fn check_commit_git_invariants(input: &str, opts: &FormattingOptions) -> Option<
     let strip_after = run_git_pipe(&["-c", &comment_cfg, "stripspace", "-s"], &once);
     let words_before: Vec<&str> = strip_before.split_whitespace().collect();
     let words_after: Vec<&str> = strip_after.split_whitespace().collect();
-    if words_before != words_after || common::render(&strip_before) != common::render(&strip_after)
+    if words_before != words_after
+        || (render_stripped && common::render(&strip_before) != common::render(&strip_after))
     {
         return Some(format!(
             "git stripspace -s changed content with {opts:?}\ninput: {input:?}\nonce: {once:?}\nstripspace before: {strip_before:?}\nstripspace after: {strip_after:?}"
@@ -646,4 +659,122 @@ fn commit_trailer_fallback_with_custom_comment_prefix_round_trips() {
             }
         }
     }
+}
+
+/// Lines that change how Git or Markdown reads a commit message, for random messages.
+const COMMIT_LINES: &[&str] = &[
+    "",
+    "",
+    "",
+    "Subject line",
+    "alpha beta gamma delta epsilon zeta eta theta iota kappa",
+    "lambda mu nu xi omicron pi rho sigma tau",
+    "Signed-off-by: A <a@b.c>",
+    "Change-Id: I0123abcd",
+    "Bug: 123",
+    "Reviewed-by: R <r@x>",
+    "Co-authored-by: C <c@d>",
+    "(cherry picked from commit 0123abcd)",
+    "Conflicts:",
+    "\tsrc/x.rs",
+    "Key: value http://example.com/a/b/c",
+    "word: colon in prose",
+    "Not-a-trailer value here",
+    " continuation line",
+    "  indented words here",
+    "# comment",
+    "#",
+    "# Heading",
+    "JJ: note",
+    "JJ: ignore-rest",
+    "# ------------------------ >8 ------------------------",
+    "-----BEGIN PGP SIGNATURE-----",
+    "-----END PGP SIGNATURE-----",
+    "---",
+    "  ---",
+    "===",
+    "  ===",
+    "* * *",
+    "diff --git a/x b/x",
+    "Index: x",
+    "+added",
+    "-removed",
+    "> quoted text and more",
+    "> Signed-off-by: Q",
+    "- item one two",
+    "  - nested item",
+    "1. numbered item",
+    "```",
+    "    code block",
+    "| a | b |",
+    "| - | - |",
+    "<rules>",
+    "</rules>",
+    "<!-- c -->",
+    "[x]: http://e.x",
+    "$$",
+    "text  ",
+    "foo\\",
+    "x = y",
+];
+
+/// Random commit messages built from [`COMMIT_LINES`] are idempotent and keep what Git reads:
+/// the words of `git stripspace -s` and the trailers. (Exact rendering is left to the example
+/// tests: such messages also hit renderer disagreements over unusual HTML blocks.) Example-based
+/// tests kept missing combinations, so this explores them; set
+/// `MARKFMT_FUZZ_CASES` (default 300) and `MARKFMT_FUZZ_SEED` to search further, and add any
+/// failure it finds to `commit_messages_round_trip_and_preserve_git_stripspace_and_trailers`.
+#[test]
+fn random_commit_messages_keep_git_invariants() {
+    let env = |name: &str, default: u64| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
+    let count = env("MARKFMT_FUZZ_CASES", 300);
+    let mut rng = Lcg(env("MARKFMT_FUZZ_SEED", 0x00c0_ffee));
+    let mut cases: Vec<(String, FormattingOptions)> = Vec::new();
+    for _ in 0..count {
+        let mut message = String::new();
+        for _ in 0..2 + rng.next() % 12 {
+            message.push_str(COMMIT_LINES[rng.next() % COMMIT_LINES.len()]);
+            message.push('\n');
+        }
+        let mut opts = FormattingOptions::default();
+        opts.commit_message = true;
+        opts.max_line_width = [12, 20, 30, 72][rng.next() % 4];
+        opts.wrap = [WrapMode::Always, WrapMode::Sentence][rng.next() % 2];
+        cases.push((message, opts));
+    }
+
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(cases.len().max(1));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let failures: Vec<String> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut local = Vec::new();
+                    while let Some((case, opts)) =
+                        cases.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                    {
+                        local.extend(check_git_invariants(case, opts, false));
+                    }
+                    local
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|w| w.join().unwrap())
+            .collect()
+    });
+    assert!(
+        failures.is_empty(),
+        "{} of {count} random commit messages failed; first:\n\n{}",
+        failures.len(),
+        failures[0]
+    );
 }

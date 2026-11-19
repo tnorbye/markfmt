@@ -455,6 +455,12 @@ metadata intact. Commit mode is enabled with `--commit-msg` (alias
   strips the comment and joins what remains.
 - Never wraps comment prefixes (`#123`), `git am` patch breaks
   (`diff -...`, `Index:`), or `Token:` prefixes to column 0.
+- Keeps quotes (`> ...`) as written, since a commit message is read as
+  plain text and reflowing a quote can pull the next line into it.
+- Changes only whitespace (and list numbers, if `ordered_lists` asks
+  for renumbering). If formatting a message would change its words,
+  the trailers Git parses, or its Markdown structure, or would format
+  differently a second time, the message is left exactly as written.
 
 ```sh
 # Wrap your interactive editor (`$MARKFMT_EDITOR`, `$VISUAL`, or `$EDITOR`)
