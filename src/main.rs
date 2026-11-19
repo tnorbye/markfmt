@@ -178,9 +178,33 @@ fn main() {
         if job.passthrough {
             return Ok((input.clone(), input, Vec::new()));
         }
-        let formatted =
-            formatter::format_file_content(&input, &job.filter_path, &range_filter, &job.options);
-        let warnings = lint::lint_with_options(&input, &job.options);
+        // A formatter bug must not take down the whole run (or, under `--commit-editor`, abort
+        // the user's commit): a panic fails only this file, which is left as it was.
+        let (formatted, warnings) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            #[cfg(debug_assertions)]
+            if std::env::var_os("MARKFMT_TEST_PANIC").is_some() {
+                panic!("MARKFMT_TEST_PANIC is set");
+            }
+            let formatted = formatter::format_file_content(
+                &input,
+                &job.filter_path,
+                &range_filter,
+                &job.options,
+            );
+            (formatted, lint::lint_with_options(&input, &job.options))
+        }))
+        .map_err(|payload| {
+            let reason = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("unknown panic");
+            format!(
+                "Internal error formatting `{}` (left unchanged): {reason}. Please report this \
+                 at https://github.com/tnorbye/markfmt/issues with the file that triggered it.",
+                job.display_name
+            )
+        })?;
         Ok::<_, String>((input, formatted, warnings))
     });
 

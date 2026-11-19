@@ -731,6 +731,42 @@ fn commit_editor_keeps_successful_edits_when_formatting_fails() {
     );
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn formatter_panics_fail_one_file_and_never_abort_a_commit() {
+    let project = Project::new();
+    project.init_git();
+    let bin = env!("CARGO_BIN_EXE_markfmt");
+    let edited = "Edited subject\n\nBody   with   intentional   spacing.\n";
+    let editor = "printf 'Edited subject\\n\\nBody   with   intentional   spacing.\\n' >";
+
+    // Under `--commit-editor`, a panic leaves the message as edited and the commit goes ahead.
+    let out = Command::new("git")
+        .current_dir(project.path())
+        .env("GIT_EDITOR", format!("\"{bin}\" --commit-editor"))
+        .env("MARKFMT_EDITOR", editor)
+        .env("MARKFMT_TEST_PANIC", "1")
+        .args(["-c", "commit.gpgsign=false", "commit", "--allow-empty"])
+        .output()
+        .unwrap();
+    assert_success(&out);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("left as edited"), "{stderr}");
+    assert!(stderr.contains("Internal error formatting"), "{stderr}");
+    assert_eq!(project.read(".git/COMMIT_EDITMSG"), edited);
+
+    // Elsewhere it is a failure (exit 2) that leaves the file unchanged.
+    let out = Command::new(bin)
+        .current_dir(project.path())
+        .env("MARKFMT_TEST_PANIC", "1")
+        .arg(".git/COMMIT_EDITMSG")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Internal error formatting"));
+    assert_eq!(project.read(".git/COMMIT_EDITMSG"), edited);
+}
+
 #[test]
 fn commit_editor_launches_editor_formats_allowlist_and_guards_recursion() {
     let project = Project::new();

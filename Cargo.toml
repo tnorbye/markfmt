@@ -67,7 +67,9 @@ unsafe_code = "forbid"
 
 [profile.release]
 lto = true
-panic = "abort"
+# Unwinding (about 8% larger than `abort`) lets a formatter panic fail just that file, so it can
+# never abort a `--commit-editor` commit or a whole run.
+panic = "unwind"
 strip = "symbols"
 codegen-units = 1
 
