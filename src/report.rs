@@ -167,7 +167,11 @@ pub fn path_label(name: &str) -> String {
 /// paragraph that was only rewrapped shows no highlighting at all.
 pub fn print_diff(name: &str, original: &str, formatted: &str) -> io::Result<()> {
     let diff = TextDiff::from_lines(original, formatted);
-    let label = path_label(name);
+    // Patch paths always use `/`; `git apply` rejects `sub\b.md` as an invalid path.
+    let mut label = path_label(name);
+    if cfg!(windows) {
+        label = label.replace('\\', "/");
+    }
     let old_header = format!("a/{label}");
     let new_header = format!("b/{label}");
     let mut udiff = diff.unified_diff();

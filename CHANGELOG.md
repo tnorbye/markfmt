@@ -72,6 +72,11 @@ and the documented library API.
   is left unchanged; other files are still formatted. Release binaries
   are built with `panic = "unwind"` for this.
 
+### Fixed
+
+- `--diff` on Windows writes `/` in patch paths, so `git apply` accepts
+  patches for files in subdirectories.
+
 ## [1.0.0] - 2026-11-14
 
 Initial release.
