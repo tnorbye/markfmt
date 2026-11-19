@@ -1690,7 +1690,12 @@ fn generated_diffs_apply_with_git_apply() {
 
     // File names in listings and messages drop `.` components too.
     let out = project.run(&["--dry-run", "."]);
-    assert_eq!(String::from_utf8(out.stdout).unwrap(), "a.md\nsub/b.md\n");
+    // Listings use the platform's separator; only patch headers always use `/`.
+    let sep = std::path::MAIN_SEPARATOR;
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        format!("a.md\nsub{sep}b.md\n")
+    );
     let out = project.run(&["--check", "./a.md"]);
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("Would reformat a.md\n"),
