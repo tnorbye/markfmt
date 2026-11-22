@@ -60,7 +60,7 @@ toml = "1"
 unicode-width = "0.2"
 
 [dev-dependencies]
-comrak = { version = "0.59", default-features = false }
+comrak = { version = "1.0", default-features = false }
 pretty_assertions = "1"
 
 [lints.rust]
